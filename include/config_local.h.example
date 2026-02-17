@@ -1,0 +1,35 @@
+#ifndef CONFIG_LOCAL_H
+#define CONFIG_LOCAL_H
+
+/**
+ * Local configuration file for WiFi and KEF speaker credentials.
+ *
+ * IMPORTANT: Copy this file to config_local.h and fill in your actual values.
+ * config_local.h is gitignored and will not be committed to the repository.
+ *
+ * Steps:
+ * 1. Copy this file: cp include/config_local.h.example include/config_local.h
+ * 2. Edit config_local.h with your actual credentials
+ * 3. config_local.h will be automatically included by config.h
+ */
+
+// ============================================================================
+// NETWORK CREDENTIALS
+// ============================================================================
+
+// Your WiFi network name (SSID)
+#define WIFI_SSID "YourWiFiNetworkName"
+
+// Your WiFi password
+#define WIFI_PASSWORD "YourWiFiPassword"
+
+// ============================================================================
+// KEF SPEAKER CONFIGURATION
+// ============================================================================
+
+// Your KEF speaker IP address
+// Find this in KEF Connect app:
+//   Settings → Speaker Name → (i) icon → IP Address
+#define KEF_SPEAKER_IP "192.168.1.217"
+
+#endif // CONFIG_LOCAL_H

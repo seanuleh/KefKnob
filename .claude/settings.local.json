@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "WebFetch(domain:www.waveshare.com)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:forums.homeseer.com)",
+      "WebFetch(domain:community.home-assistant.io)",
+      "WebFetch(domain:aiokef.readthedocs.io)",
+      "Bash(chmod:*)",
+      "Bash(ls:*)",
+      "Bash(pio run:*)",
+      "Bash(pio device list:*)",
+      "Bash(pio device monitor:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:www.home-assistant.io)",
+      "WebFetch(domain:gist.github.com)",
+      "Bash(pio pkg search:*)"
+    ]
+  }
+}
