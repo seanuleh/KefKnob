@@ -56,10 +56,9 @@ static bool g_state_dirty = false;
 // Volatile commands — written by Core 1 input callbacks, consumed by Core 0
 // ============================================================================
 
-static volatile int      g_volume_target          = -1;
-static volatile bool     g_volume_dirty           = false;
-static volatile uint32_t g_volume_last_change_ms  = 0;
-static volatile char     g_track_cmd[12]          = "";
+static volatile int      g_volume_target = -1;
+static volatile bool     g_volume_dirty  = false;
+static volatile char     g_track_cmd[12] = "";
 
 // ============================================================================
 // USB source + mute + power state — written by Core 0, read by Core 1
@@ -257,7 +256,6 @@ static void encoder_left_cb(void *arg, void *data) {
     if (next < VOLUME_MIN) next = VOLUME_MIN;
     g_volume_target = next;
     g_volume_dirty = true;
-    g_volume_last_change_ms = (uint32_t)millis();
     DEBUG_PRINTF("[Encoder] Volume target: %d\n", next);
 }
 
@@ -267,7 +265,6 @@ static void encoder_right_cb(void *arg, void *data) {
     if (next > VOLUME_MAX) next = VOLUME_MAX;
     g_volume_target = next;
     g_volume_dirty = true;
-    g_volume_last_change_ms = (uint32_t)millis();
     DEBUG_PRINTF("[Encoder] Volume target: %d\n", next);
 }
 
@@ -505,9 +502,13 @@ void networkTask(void *pvParameters) {
         uint32_t now = (uint32_t)millis();
 
         // --- Pending volume command ---
+        // Gate on time-since-last-SEND, not time-since-last-tick. This sends the
+        // current target every 250ms while the encoder is turning (real-time
+        // tracking) and within 250ms of stopping. Avoids the KEF rate-limit
+        // that returns 0 if commands arrive faster than ~250ms apart.
         if (g_volume_dirty && g_volume_target >= 0) {
-            uint32_t idle = now - (uint32_t)g_volume_last_change_ms;
-            if (idle >= (uint32_t)VOLUME_DEBOUNCE_MS) {
+            uint32_t since_sent = now - volume_sent_ms;
+            if (since_sent >= (uint32_t)VOLUME_DEBOUNCE_MS) {
                 g_volume_dirty = false;
                 int target = g_volume_target;
                 if (kef_set_volume(target)) {

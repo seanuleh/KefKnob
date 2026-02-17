@@ -1,5 +1,7 @@
 # KefKnob - Agent Instructions
 
+> **Agent rule:** After completing any task that changes behaviour, adds/removes features, modifies the API usage, or changes shared state, update the relevant sections of this file before finishing. Keep the File Map, Architecture, KEF API Reference, UI Overview, and Debugging Checklist accurate. Update the "Last updated" line and the working-features list at the bottom.
+
 KEF LSX II speaker controller running on a Waveshare ESP32-S3 1.8" Touch LCD.
 **Current status: fully working.** Display renders, touch works, encoder works, WiFi connects, KEF volume/track/source/power control works, album art displays, standby screen shows when speaker is off.
 
@@ -29,8 +31,9 @@ KEF LSX II speaker controller running on a Waveshare ESP32-S3 1.8" Touch LCD.
 Core 0 — networkTask()                Core 1 — loop() / Arduino main
 ──────────────────────────────────    ────────────────────────────────────
 Loops every 50ms                      lv_timer_handler() every 5ms
-  ├─ If g_volume_dirty AND idle         Reads g_volume_target → immediate
-  │    250ms: kef_set_volume()            arc redraw (no waiting)
+  ├─ If g_volume_dirty AND              Reads g_volume_target → immediate
+  │    250ms since last send:             arc redraw (no waiting)
+  │    kef_set_volume()                   (sends every 250ms while turning)
   ├─ If g_track_cmd set:                On g_state_dirty: snapshot state
   │    kef_track_control()                under mutex → main_screen_update()
   ├─ If g_control_cmd set:               main_screen_update_power_source()
@@ -47,7 +50,7 @@ Loops every 50ms                      lv_timer_handler() every 5ms
 **Thread safety rules:**
 - All LVGL calls must happen on Core 1 (in `loop()` or encoder/touch callbacks, which fire on Core 1)
 - `g_title`, `g_artist`, `g_is_playing`, `g_volume` are protected by `g_state_mutex`
-- `g_volume_target`, `g_volume_dirty`, `g_volume_last_change_ms`, `g_track_cmd`, `g_control_cmd` are `volatile`, written by Core 1 callbacks, read/cleared by Core 0 — no mutex needed (single writer, single reader)
+- `g_volume_target`, `g_volume_dirty`, `g_track_cmd`, `g_control_cmd` are `volatile`, written by Core 1 callbacks, read/cleared by Core 0 — no mutex needed (single writer, single reader)
 
 ### Shared state globals (all in `src/main.cpp`)
 
@@ -60,10 +63,9 @@ static bool g_is_playing;       // playback state
 static bool g_state_dirty;      // true = Core 1 should redraw
 
 // Volatile — written by Core 1 input callbacks, consumed by Core 0
-static volatile int      g_volume_target;         // -1 = none pending
-static volatile bool     g_volume_dirty;          // send volume to KEF
-static volatile uint32_t g_volume_last_change_ms; // debounce timestamp
-static volatile char     g_track_cmd[12];         // "pause"/"next"/"previous"/""
+static volatile int      g_volume_target; // -1 = none pending
+static volatile bool     g_volume_dirty;  // send volume to KEF
+static volatile char     g_track_cmd[12]; // "pause"/"next"/"previous"/""
 static volatile char     g_control_cmd[16];       // "power"/"src_wifi"/"src_usb"/"pwr_wifi"/"pwr_usb"
 
 // Written by Core 0, read by Core 1
@@ -107,43 +109,57 @@ All calls are HTTP GET. URL-encode colons as `%3A`, slashes as `%2F`, `{` as `%7
 
 ### Working endpoints (confirmed on LSX II firmware)
 
-| Function | Path | Roles | Value |
-|---|---|---|---|
-| Get volume | `player:volume` | `value` | — |
-| Set volume | `player:volume` | `value` | `{"type":"i32_","i32_":N}` |
-| Get player data | `player:player/data` | `value` | — |
-| Track control | `player:player/control` | `activate` | `{"control":"CMD"}` CMD = pause/next/previous |
-| Get source | `settings:/kef/play/physicalSource` | `value` | — |
-| **Set source / power** | `settings:/kef/play/physicalSource` | **`value`** | `{"type":"kefPhysicalSource","kefPhysicalSource":"SRC"}` |
-| Get speaker status | `settings:/kef/host/speakerStatus` | `value` | — |
+| Function | Path | Roles | Value | Response field |
+|---|---|---|---|---|
+| Get volume | `player:volume` | `value` | — | `[0]["i32_"]` (int) |
+| Set volume | `player:volume` | `value` | `{"type":"i32_","i32_":N}` | — |
+| Get player data | `player:player/data` | `value` | — | see below |
+| Track control | `player:player/control` | `activate` | `{"control":"CMD"}` | — |
+| Get source | `settings:/kef/play/physicalSource` | `value` | — | `[0]["kefPhysicalSource"]` (string) |
+| Set source / power | `settings:/kef/play/physicalSource` | `value` | `{"type":"kefPhysicalSource","kefPhysicalSource":"SRC"}` | — |
+| Get speaker status | `settings:/kef/host/speakerStatus` | `value` | — | `[0]["kefSpeakerStatus"]` (string) |
+| Set mute | `settings:/mediaPlayer/mute` | `value` | `{"type":"bool_","bool_":true}` | — |
+
+**Track control CMD values:** `"pause"`, `"next"`, `"previous"`
 
 **Source / power values for `kefPhysicalSource`:**
-- `"wifi"` — stream/WiFi input
+- `"wifi"` — WiFi streaming input
 - `"usb"` — USB audio input
 - `"bluetooth"` — Bluetooth input
-- `"optical"` / `"optic"` — optical input
+- `"optic"` — optical input
 - `"coaxial"` — coaxial input
 - `"analog"` — analog input
-- `"powerOn"` — wake from standby (no source change)
+- `"powerOn"` — wake from standby without changing source
 - `"standby"` — send to standby
 
-**Critical: ALL source and power commands use `roles=value`.** `roles=activate` returns HTTP 500 on this firmware for the physicalSource path. Track control (`player:player/control`) is the only command that correctly uses `roles=activate`.
+**Player data response fields** (from `player:player/data`, array index 0):
+```
+["state"]                                          → "playing" | "pause" | "stopped"
+["trackRoles"]["title"]                            → track title string
+["trackRoles"]["mediaData"]["metaData"]["artist"]  → artist string
+["trackRoles"]["icon"]                             → album art HTTPS URL (Spotify CDN)
+```
 
-**Speaker status values:**
-- `kefSpeakerStatus: "powerOn"` — speaker is physically on (playing, paused, or idle)
-- Any other value — speaker is in standby
+**Critical: ALL `physicalSource` commands use `roles=value`**, not `roles=activate`. `roles=activate` returns HTTP 500 on this firmware. Track control (`player:player/control`) is the only command that uses `roles=activate`.
 
-**Player state values** (from `player:player/data`):
+**Speaker status values** (`kefSpeakerStatus`):
+- `"powerOn"` — speaker is physically on (playing, paused, or idle)
+- anything else — speaker is in standby
+
+**Player state values** (`state` field):
 - `"playing"` — actively playing
 - `"pause"` — paused
-- `"stopped"` — idle (speaker ON but not playing) **or** standby
-- Do NOT use player state for standby detection — use `speakerStatus` instead
+- `"stopped"` — idle/stopped (speaker ON but not playing) **or** in standby
+- **Do not use player state for standby detection** — `"stopped"` is returned for both on-but-idle and off. Use `speakerStatus` instead.
+
+**Dead code in `kef_api.cpp` — do not use:**
+- `kef_get_power()` — queries `player:power` which returns HTTP 500 on this firmware
+- `kef_power_on()` — superseded by `kef_set_power(true)` which calls `kef_set_source("powerOn")`
 
 **Known KEF API behaviour:**
 - Rate limiting: volume commands faster than ~250ms apart cause the API to return 0 → use `VOLUME_DEBOUNCE_MS` (250ms)
-- Stale reads: `getData` immediately after `setData` returns old value → skip volume poll for 3s after setting
-- Setting `physicalSource` with `roles=value` wakes from standby AND switches source in a single call
-- `player:power` endpoint returns HTTP 500 on this firmware — do not use
+- Stale reads: `getData` immediately after `setData` returns old value → skip volume poll for 3s after a set
+- Setting `physicalSource` wakes from standby AND switches source in one call — no separate wake step needed
 
 ---
 
