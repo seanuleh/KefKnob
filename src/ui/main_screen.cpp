@@ -499,10 +499,18 @@ void main_screen_update(int volume, const char *title,
         lv_label_set_text_fmt(s_vol_shadow[i], "%d", volume);
     }
 
-    // Track progress bar
-    int pct = (progress_pct < 0) ? 0 : (progress_pct > 100) ? 100 : progress_pct;
-    lv_bar_set_value(s_progress_outline, pct, LV_ANIM_OFF);
-    lv_bar_set_value(s_progress_bar,     pct, LV_ANIM_OFF);
+    // Track progress bar — hidden on USB when Spotify is not active
+    bool show_progress = !source_is_usb || spotify_active;
+    if (show_progress) {
+        int pct = (progress_pct < 0) ? 0 : (progress_pct > 100) ? 100 : progress_pct;
+        lv_bar_set_value(s_progress_outline, pct, LV_ANIM_OFF);
+        lv_bar_set_value(s_progress_bar,     pct, LV_ANIM_OFF);
+        lv_obj_clear_flag(s_progress_outline, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_progress_bar,     LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_progress_outline, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_progress_bar,     LV_OBJ_FLAG_HIDDEN);
+    }
 
     // Show correct button set and update state-dependent icons
     if (source_is_usb) {
@@ -536,14 +544,18 @@ void main_screen_update(int volume, const char *title,
             is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     }
 
-    lv_label_set_text(s_title_label, (title && title[0]) ? title : "--");
-
-    bool has_artist = artist && artist[0] && strcmp(artist, "--") != 0;
-    if (has_artist) {
-        lv_label_set_text(s_artist_label, artist);
-        lv_obj_clear_flag(s_artist_label, LV_OBJ_FLAG_HIDDEN);
-    } else {
+    if (source_is_usb && !spotify_active) {
+        lv_label_set_text(s_title_label, "USB");
         lv_obj_add_flag(s_artist_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(s_title_label, (title && title[0]) ? title : "--");
+        bool has_artist = artist && artist[0] && strcmp(artist, "--") != 0;
+        if (has_artist) {
+            lv_label_set_text(s_artist_label, artist);
+            lv_obj_clear_flag(s_artist_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_artist_label, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 

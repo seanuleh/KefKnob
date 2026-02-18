@@ -26,6 +26,10 @@
 // NETWORK CONFIGURATION
 // ============================================================================
 
+// OTA
+#define OTA_HOSTNAME "deskknob"
+// #define OTA_PASSWORD "changeme"  // Uncomment to require a password
+
 // KEF API Configuration
 #define KEF_API_PORT 80
 #define KEF_API_BASE_URL "http://" KEF_SPEAKER_IP "/api"

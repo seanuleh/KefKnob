@@ -14,6 +14,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <lvgl.h>
 #include "config.h"
 #include "drivers/display_sh8601.h"
@@ -105,6 +106,7 @@ void initDisplay();
 void initTouch();
 void initEncoder();
 void initWiFi();
+void initOTA();
 void initLVGL();
 void createTasks();
 
@@ -166,6 +168,10 @@ void setup() {
     initWiFi();
     DEBUG_PRINTLN("[INIT] WiFi initialized");
 
+    DEBUG_PRINTLN("[INIT] Initializing OTA...");
+    initOTA();
+    DEBUG_PRINTLN("[INIT] OTA initialized");
+
     DEBUG_PRINTLN("[INIT] Creating FreeRTOS tasks...");
     createTasks();
     DEBUG_PRINTLN("[INIT] Tasks created");
@@ -180,6 +186,7 @@ void setup() {
 // ============================================================================
 
 void loop() {
+    ArduinoOTA.handle();
     lv_timer_handler();
 
     // --- Album art decode (Core 1 only — LVGL canvas write) ---
@@ -317,6 +324,28 @@ void initWiFi() {
     DEBUG_PRINTLN("[WiFi] Connected!");
     DEBUG_PRINTF("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
     DEBUG_PRINTF("[WiFi] Signal: %d dBm\n", WiFi.RSSI());
+}
+
+void initOTA() {
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+#ifdef OTA_PASSWORD
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+#endif
+    ArduinoOTA.onStart([]() {
+        DEBUG_PRINTLN("[OTA] Starting update...");
+    });
+    ArduinoOTA.onEnd([]() {
+        DEBUG_PRINTLN("[OTA] Done. Rebooting.");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        DEBUG_PRINTF("[OTA] %u%%\n", progress * 100 / total);
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        DEBUG_PRINTF("[OTA] Error(%u)\n", error);
+    });
+    ArduinoOTA.begin();
+    DEBUG_PRINTF("[OTA] Hostname: %s.local  IP: %s\n",
+                 OTA_HOSTNAME, WiFi.localIP().toString().c_str());
 }
 
 void initLVGL() {
