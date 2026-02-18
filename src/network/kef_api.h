@@ -35,7 +35,9 @@ bool kef_get_player_data(char *title, size_t title_len,
                          char *artist, size_t artist_len,
                          bool *out_playing,
                          bool *out_is_standby,
-                         char *cover_url, size_t cover_url_len);
+                         char *cover_url, size_t cover_url_len,
+                         uint32_t *out_position_ms,
+                         uint32_t *out_duration_ms);
 
 /**
  * Send a playback control command.

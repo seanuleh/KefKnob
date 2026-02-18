@@ -15,7 +15,9 @@ void main_screen_create();
  * Must be called only from Core 1 (the LVGL thread).
  */
 void main_screen_update(int volume, const char *title,
-                        const char *artist, bool is_playing);
+                        const char *artist, bool is_playing,
+                        bool source_is_usb, bool is_muted,
+                        bool spotify_active, int progress_pct);
 
 /**
  * Decode a JPEG and blit it to the album art canvas.
@@ -58,3 +60,10 @@ void main_screen_update_power_source(bool power_on, bool source_is_usb);
  * Must be called only from Core 1.
  */
 const char *main_screen_take_control_cmd();
+
+/**
+ * Take (and clear) a pending track command set by a bottom playback button tap.
+ * Returns nullptr if no command is pending.
+ * Must be called only from Core 1.
+ */
+const char *main_screen_take_track_cmd();

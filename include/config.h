@@ -15,6 +15,13 @@
     #define KEF_SPEAKER_IP "192.168.1.217"
 #endif
 
+// Spotify credentials — set in config_local.h. Leave empty to disable.
+#ifndef SPOTIFY_CLIENT_ID
+    #define SPOTIFY_CLIENT_ID     ""
+    #define SPOTIFY_CLIENT_SECRET ""
+    #define SPOTIFY_REFRESH_TOKEN ""
+#endif
+
 // ============================================================================
 // NETWORK CONFIGURATION
 // ============================================================================
@@ -109,7 +116,7 @@
 #define ALBUM_ART_SIZE       360          // Decoded canvas px — fills the round display
 #define ALBUM_ART_JPEG_SCALE 1            // TJpgDec full-res; center-crop in callback
 #define ALBUM_ART_JPEG_SRC   640          // Spotify standard JPEG dimension (px)
-#define ALBUM_ART_MAX_JPEG   (150 * 1024) // Max JPEG bytes to allocate in PSRAM
+#define ALBUM_ART_MAX_JPEG   (256 * 1024) // Max JPEG bytes to allocate in PSRAM
 
 // ============================================================================
 // DEBUG CONFIGURATION
@@ -139,7 +146,7 @@
 
 // Task stack sizes
 #define UI_TASK_STACK_SIZE      (4 * 1024)   // UI handled in loop(), minimal task
-#define NETWORK_TASK_STACK_SIZE (28 * 1024)  // HTTP + JSON + TLS for HTTPS art fetch
+#define NETWORK_TASK_STACK_SIZE (36 * 1024)  // HTTP + JSON + TLS (KEF + Spotify HTTPS)
 
 // Task core assignments
 #define UI_TASK_CORE 1

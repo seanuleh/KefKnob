@@ -20,6 +20,7 @@
 #include "drivers/touch_cst816.h"
 #include "drivers/encoder.h"
 #include "network/kef_api.h"
+#include "network/spotify_api.h"
 #include "ui/main_screen.h"
 
 // ============================================================================
@@ -64,9 +65,11 @@ static volatile char     g_track_cmd[12] = "";
 // USB source + mute + power state — written by Core 0, read by Core 1
 // ============================================================================
 
-static volatile bool g_source_is_usb = false;
-static volatile bool g_is_muted      = false;
-static volatile bool g_power_on      = true;
+static volatile bool g_source_is_usb  = false;
+static volatile bool g_is_muted       = false;
+static volatile bool g_power_on       = true;
+static volatile bool g_spotify_active = false;  // Spotify session detected on USB
+static volatile int  g_progress_pct   = 0;      // Track progress 0-100
 
 // Control panel commands — written by Core 1 (button callbacks via main_screen),
 // consumed by Core 0 networkTask
@@ -198,9 +201,18 @@ void loop() {
         }
     }
 
+    // --- Forward bottom playback button commands to network task ---
+    {
+        const char *track = main_screen_take_track_cmd();
+        if (track && track[0] != '\0') {
+            strncpy((char *)g_track_cmd, track, sizeof(g_track_cmd) - 1);
+        }
+    }
+
     // --- Text/volume update ---
     if (g_volume_target >= 0) {
-        main_screen_update(g_volume_target, g_title, g_artist, g_is_playing);
+        main_screen_update(g_volume_target, g_title, g_artist, g_is_playing,
+                           g_source_is_usb, g_is_muted, g_spotify_active, g_progress_pct);
     } else if (g_state_dirty) {
         g_state_dirty = false;
 
@@ -216,7 +228,8 @@ void loop() {
             strncpy(artist, g_artist, sizeof(artist));
             xSemaphoreGive(g_state_mutex);
 
-            main_screen_update(vol, title, artist, playing);
+            main_screen_update(vol, title, artist, playing,
+                               g_source_is_usb, g_is_muted, g_spotify_active, g_progress_pct);
             main_screen_update_power_source(g_power_on, g_source_is_usb);
         }
     }
@@ -444,12 +457,9 @@ void lvgl_touch_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
             bool vert_swipe  = (abs(dy) >= SWIPE_THRESHOLD && abs(dy) >  abs(dx));
             bool from_top    = (touch_start_y < LCD_HEIGHT / 3);
 
-            if (horiz_swipe && dx > 0) {
-                strncpy((char *)g_track_cmd, "previous", sizeof(g_track_cmd) - 1);
-                DEBUG_PRINTLN("[Touch] Swipe right → previous");
-            } else if (horiz_swipe && dx < 0) {
-                strncpy((char *)g_track_cmd, "next", sizeof(g_track_cmd) - 1);
-                DEBUG_PRINTLN("[Touch] Swipe left → next");
+            if (horiz_swipe) {
+                // TODO: navigate between screens (swipe left/right)
+                DEBUG_PRINTLN("[Touch] Horizontal swipe (reserved: screen navigation)");
             } else if (vert_swipe && from_top && dy > 0) {
                 // Slide from top down → toggle control panel
                 main_screen_toggle_control_panel();
@@ -458,16 +468,9 @@ void lvgl_touch_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
                 // Any other gesture while panel is open → close it
                 main_screen_toggle_control_panel();
                 DEBUG_PRINTLN("[Touch] Tap/swipe → close control panel");
-            } else if (g_source_is_usb) {
-                strncpy((char *)g_track_cmd,
-                        g_is_muted ? "unmute" : "mute",
-                        sizeof(g_track_cmd) - 1);
-                DEBUG_PRINTF("[Touch] Tap → %s (USB source)\n",
-                             g_is_muted ? "unmute" : "mute");
-            } else {
-                strncpy((char *)g_track_cmd, "pause", sizeof(g_track_cmd) - 1);
-                DEBUG_PRINTLN("[Touch] Tap → play/pause");
             }
+            // Playback controls (play/pause, mute, prev, next) are handled
+            // by the on-screen buttons via main_screen_take_track_cmd().
             was_pressed = false;
         }
         data->state = LV_INDEV_STATE_REL;
@@ -486,7 +489,17 @@ void lvgl_encoder_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
 void networkTask(void *pvParameters) {
     DEBUG_PRINTLN("[Network Task] Started on Core 0");
 
+    spotify_init(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN);
+
     static uint32_t last_poll_ms   = 0;
+    static bool     sp_is_playing  = false;  // Core 0 local — tracks Spotify play state
+
+    // Client-side position estimation for KEF WiFi source (API has no position field)
+    static uint32_t kef_track_dur_ms    = 0;     // duration from KEF status.duration
+    static uint32_t kef_pos_est_ms      = 0;     // estimated current position
+    static uint32_t kef_pos_ref_esp_ms  = 0;     // millis() at last reference point
+    static bool     kef_pos_was_playing = false; // was playing at last reference point
+    static char     kef_pos_last_url[256] = "";  // track change detection via cover URL
     static uint32_t volume_sent_ms = 0;
     static char     last_cover_url[256] = "";  // detects track change for art fetch
 
@@ -533,6 +546,16 @@ void networkTask(void *pvParameters) {
                 if (kef_set_mute(true))  g_is_muted = true;
             } else if (strcmp(cmd, "unmute") == 0) {
                 if (kef_set_mute(false)) g_is_muted = false;
+            } else if (g_source_is_usb && g_spotify_active) {
+                // Route playback commands to Spotify API on USB source
+                if (strcmp(cmd, "pause") == 0) {
+                    if (sp_is_playing) spotify_pause();
+                    else               spotify_play();
+                } else if (strcmp(cmd, "next") == 0) {
+                    spotify_next();
+                } else if (strcmp(cmd, "previous") == 0) {
+                    spotify_previous();
+                }
             } else {
                 kef_track_control(cmd);
             }
@@ -581,13 +604,80 @@ void networkTask(void *pvParameters) {
                 g_power_on = speaker_on;
             }
 
-            bool is_standby = false;
-            if (kef_get_player_data(title, sizeof(title),
-                                    artist, sizeof(artist),
-                                    &playing,
-                                    &is_standby,
-                                    cover_url, sizeof(cover_url))) {
+            // --- Player data: Spotify on USB, KEF on WiFi ---
+            bool player_data_ok = false;
+            bool is_standby     = false;
 
+            if (g_source_is_usb) {
+                // USB source — poll Spotify for now-playing metadata.
+                // The same shared state and art pipeline are reused as-is.
+                bool sp_playing = false;
+                bool sp_nothing = false;
+                uint32_t sp_progress_ms = 0, sp_duration_ms = 0;
+                if (spotify_get_now_playing(title,     sizeof(title),
+                                            artist,    sizeof(artist),
+                                            cover_url, sizeof(cover_url),
+                                            &sp_playing, &sp_nothing,
+                                            &sp_progress_ms, &sp_duration_ms)) {
+                    playing          = sp_playing;
+                    sp_is_playing    = sp_playing;
+                    player_data_ok   = true;
+                    g_spotify_active = true;
+                    g_progress_pct   = (sp_duration_ms > 0)
+                        ? (int)((uint64_t)sp_progress_ms * 100 / sp_duration_ms) : 0;
+                } else if (sp_nothing) {
+                    // Spotify explicitly says nothing is playing — clear screen
+                    strncpy(title,  "--", sizeof(title));
+                    strncpy(artist, "--", sizeof(artist));
+                    cover_url[0]     = '\0';
+                    playing          = false;
+                    sp_is_playing    = false;
+                    player_data_ok   = true;
+                    g_spotify_active = false;
+                    g_progress_pct   = 0;
+                }
+                // On network error: keep previous state and g_spotify_active as-is.
+            } else {
+                uint32_t kef_pos_ms = 0, kef_dur_ms = 0;
+                player_data_ok = kef_get_player_data(title,     sizeof(title),
+                                                     artist,    sizeof(artist),
+                                                     &playing,
+                                                     &is_standby,
+                                                     cover_url, sizeof(cover_url),
+                                                     &kef_pos_ms, &kef_dur_ms);
+                if (player_data_ok) {
+                    // KEF API has no position field — estimate client-side.
+                    // Advance kef_pos_est_ms by time elapsed since last poll while playing;
+                    // freeze while paused; reset to 0 when the track changes.
+                    uint32_t now_ms = (uint32_t)millis();
+
+                    bool track_changed = (strncmp(cover_url, kef_pos_last_url,
+                                                  sizeof(kef_pos_last_url)) != 0);
+                    if (track_changed) {
+                        strncpy(kef_pos_last_url, cover_url, sizeof(kef_pos_last_url) - 1);
+                        kef_pos_est_ms     = 0;
+                        kef_pos_ref_esp_ms = now_ms;
+                        kef_pos_was_playing = playing;
+                    }
+
+                    if (kef_dur_ms > 0) kef_track_dur_ms = kef_dur_ms;
+
+                    // Add elapsed time only if we were playing since last reference
+                    if (kef_pos_was_playing) {
+                        uint32_t elapsed = now_ms - kef_pos_ref_esp_ms;
+                        kef_pos_est_ms += elapsed;
+                        if (kef_track_dur_ms > 0 && kef_pos_est_ms > kef_track_dur_ms)
+                            kef_pos_est_ms = kef_track_dur_ms;
+                    }
+                    kef_pos_ref_esp_ms  = now_ms;
+                    kef_pos_was_playing = playing;
+
+                    g_progress_pct = (kef_track_dur_ms > 0)
+                        ? (int)((uint64_t)kef_pos_est_ms * 100 / kef_track_dur_ms) : 0;
+                }
+            }
+
+            if (player_data_ok) {
                 if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     strncpy(g_title,  title,  sizeof(g_title) - 1);
                     strncpy(g_artist, artist, sizeof(g_artist) - 1);

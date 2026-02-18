@@ -88,7 +88,9 @@ bool kef_get_player_data(char *title, size_t title_len,
                          char *artist, size_t artist_len,
                          bool *out_playing,
                          bool *out_is_standby,
-                         char *cover_url, size_t cover_url_len) {
+                         char *cover_url, size_t cover_url_len,
+                         uint32_t *out_position_ms,
+                         uint32_t *out_duration_ms) {
     char url[256];
     snprintf(url, sizeof(url),
              "http://" KEF_SPEAKER_IP
@@ -128,6 +130,10 @@ bool kef_get_player_data(char *title, size_t title_len,
     const char *icon = root["trackRoles"]["icon"] | "";
     strncpy(cover_url, icon, cover_url_len - 1);
     cover_url[cover_url_len - 1] = '\0';
+
+    // Duration is at root["status"]["duration"] (ms). Position is not in the API.
+    *out_position_ms = 0;
+    *out_duration_ms = root["status"]["duration"] | 0;
 
     DEBUG_PRINTF("[KEF] State: %s | Now playing: %s - %s\n", state, title, artist);
     return true;
