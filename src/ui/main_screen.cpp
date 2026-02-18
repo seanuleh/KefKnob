@@ -1,7 +1,10 @@
 #include "main_screen.h"
 #include "config.h"
+#include "../drivers/mic_pdm.h"
 
 #include <TJpg_Decoder.h>
+#include <math.h>
+#include <string.h>
 
 // ---------------------------------------------------------------------------
 // Widget handles (file-local)
@@ -303,19 +306,19 @@ void main_screen_create() {
     // Canvas: WAVE_CANVAS_W × WAVE_CANVAS_H px, RGB565, in internal SRAM.
     // Layer order: sits directly above the progress bar objects (already hidden).
     // Bars grow symmetrically from the vertical centre, oldest bar on the left.
-    s_wave_buf = (uint8_t *)malloc((size_t)WAVE_CANVAS_W * WAVE_CANVAS_H * sizeof(uint16_t));
+    // TRUE_COLOR_ALPHA: 3 bytes/pixel (RGB565 + 8-bit alpha). alpha=0 = transparent.
+    s_wave_buf = (uint8_t *)malloc((size_t)WAVE_CANVAS_W * WAVE_CANVAS_H * 3);
     if (s_wave_buf) {
+        memset(s_wave_buf, 0, (size_t)WAVE_CANVAS_W * WAVE_CANVAS_H * 3);
         s_wave_canvas = lv_canvas_create(s_screen);
         lv_canvas_set_buffer(s_wave_canvas, s_wave_buf,
-                             WAVE_CANVAS_W, WAVE_CANVAS_H, LV_IMG_CF_TRUE_COLOR);
+                             WAVE_CANVAS_W, WAVE_CANVAS_H, LV_IMG_CF_TRUE_COLOR_ALPHA);
         lv_obj_set_size(s_wave_canvas, WAVE_CANVAS_W, WAVE_CANVAS_H);
-        // y=+75: canvas spans +60..+90 from display centre.
-        // Arc endpoints are at +70 (arc ends there), so the top few rows of
-        // the canvas lie inside the arc gap — no visual overlap.
-        lv_obj_align(s_wave_canvas, LV_ALIGN_CENTER, 0, 75);
+        // y=+62: centred between artist label (bottom ≈ +32) and button row (top ≈ +92).
+        lv_obj_align(s_wave_canvas, LV_ALIGN_CENTER, 0, 62);
         lv_obj_set_style_bg_opa(s_wave_canvas, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(s_wave_canvas, 0, 0);
         lv_obj_clear_flag(s_wave_canvas, LV_OBJ_FLAG_CLICKABLE);
-        lv_canvas_fill_bg(s_wave_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
         lv_obj_add_flag(s_wave_canvas, LV_OBJ_FLAG_HIDDEN);  // shown on first update
     }
 
@@ -620,40 +623,110 @@ void main_screen_update_art(const uint8_t *jpeg_buf, size_t jpeg_size) {
 // Called from Core 1 every MIC_BAR_MS ms by loop().
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Siri-style multicolour waveform renderer.
+//
+// Draws 4 overlapping sine waves — one per frequency band — directly into the
+// RGB565 canvas pixel buffer.  Each wave is amplitude-modulated by its band's
+// energy and shaped by a Hann window so the edges taper to nothing (giving the
+// "eye / lens" silhouette).  Phases advance every call for flowing animation.
+//
+// Additive RGB blending is used: where two waves share a pixel their colours
+// sum (clamped at 255), producing vivid mixed hues at intersections.
+//
+// Band → colour mapping:
+//   bass  (<250 Hz)  deep blue   (  0,  60, 255)
+//   mid   (250-1kHz) cyan        (  0, 220, 255)
+//   hmid  (1-4kHz)   green-gold  ( 80, 255,  40)
+//   high  (>4kHz)    pink-mag    (255,  40, 180)
+// ---------------------------------------------------------------------------
 void main_screen_update_waveform(const uint8_t *levels, int count) {
-    if (!s_wave_canvas || !s_wave_buf || !levels || count <= 0) return;
+    if (!s_wave_canvas || !s_wave_buf) return;
 
-    // Clear canvas to solid black background.
-    lv_canvas_fill_bg(s_wave_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+    // Read raw band energies (0–255 → 0.0–1.0)
+    float raw_bass = g_band_bass / 255.0f;
+    float raw_mid  = g_band_mid  / 255.0f;
+    float raw_hmid = g_band_hmid / 255.0f;
+    float raw_high = g_band_high / 255.0f;
 
-    lv_draw_rect_dsc_t dsc;
-    lv_draw_rect_dsc_init(&dsc);
-    dsc.bg_color     = lv_color_hex(0x00BFFF);
-    dsc.bg_opa       = LV_OPA_COVER;
-    dsc.radius       = 2;           // slightly rounded bar ends
-    dsc.border_width = 0;
-    dsc.shadow_width = 0;
+    // Per-band auto-gain: each band tracks its own rolling peak so all four
+    // waves share equal visual presence regardless of which frequency dominates.
+    // Fast attack, ~3 s decay half-life at 12.5 Hz. Floor keeps silence flat.
+    static float pk_bass = 0.15f, pk_mid = 0.15f;
+    static float pk_hmid = 0.15f, pk_high = 0.15f;
+    constexpr float DECAY = 0.982f, FLOOR = 0.15f;
+    if (raw_bass > pk_bass) pk_bass = raw_bass; pk_bass *= DECAY; if (pk_bass < FLOOR) pk_bass = FLOOR;
+    if (raw_mid  > pk_mid ) pk_mid  = raw_mid;  pk_mid  *= DECAY; if (pk_mid  < FLOOR) pk_mid  = FLOOR;
+    if (raw_hmid > pk_hmid) pk_hmid = raw_hmid; pk_hmid *= DECAY; if (pk_hmid < FLOOR) pk_hmid = FLOOR;
+    if (raw_high > pk_high) pk_high = raw_high; pk_high *= DECAY; if (pk_high < FLOOR) pk_high = FLOOR;
 
-    // Bar geometry (must match WAVE_CANVAS_W / MIC_N_BARS in config.h)
-    const int bar_w   = 5;
-    const int gap     = 3;
-    const int step    = bar_w + gap;   // 8 px per slot
-    const int ch      = WAVE_CANVAS_H; // 30
-    const int cy      = ch / 2;        // 15 — centre line
-    const int max_hh  = cy - 2;        // 13 — max half-height (2 px margin)
-    const int min_hh  = 1;             // 1  — half-height at silence
+    float bass = raw_bass / pk_bass; if (bass > 1.0f) bass = 1.0f;
+    float mid  = raw_mid  / pk_mid;  if (mid  > 1.0f) mid  = 1.0f;
+    float hmid = raw_hmid / pk_hmid; if (hmid > 1.0f) hmid = 1.0f;
+    float high = raw_high / pk_high; if (high > 1.0f) high = 1.0f;
 
-    // Centre all bars horizontally within the canvas.
-    // total bar-span = count * step - gap (omit trailing gap)
-    int total_w = count * step - gap;
-    int margin  = (WAVE_CANVAS_W - total_w) / 2;  // ≈ 1 px for 20 bars
+    // Advance phase for each wave every call (~12.5 Hz).
+    // Different speeds give each wave its own character.
+    static float t_bass = 0.0f, t_mid = 0.0f, t_hmid = 0.0f, t_high = 0.0f;
+    t_bass += 0.07f;
+    t_mid  += 0.11f;
+    t_hmid += 0.16f;
+    t_high += 0.22f;
 
-    for (int i = 0; i < count; i++) {
-        int hh    = min_hh + ((int)levels[i] * (max_hh - min_hh)) / 255;
-        int bar_h = hh * 2;
-        int x     = margin + i * step;
-        int y     = cy - hh;
-        lv_canvas_draw_rect(s_wave_canvas, x, y, bar_w, bar_h, &dsc);
+    const int   W   = WAVE_CANVAS_W;   // 160
+    const int   H   = WAVE_CANVAS_H;   // 40
+    const int   cy  = H / 2;           // 20 — vertical centre
+    const float glow = 5.5f;           // neon glow radius in pixels
+    const float mhh  = (float)cy - glow - 2.0f; // wave peak never clips canvas edge
+
+    // Clear to fully transparent (alpha byte = 0 in the 3-byte TRUE_COLOR_ALPHA format).
+    memset(s_wave_buf, 0, (size_t)(W * H) * 3);
+
+    for (int x = 0; x < W; x++) {
+        float cx  = (float)x / (float)(W - 1);
+        float win = sinf(3.14159265f * cx);  // Hann window — tapers to 0 at edges
+
+        // Floating-point wave peak offsets (signed px from canvas centre row).
+        float p_bass_f = bass * win * sinf(2.0f * 3.14159265f * 1.5f * cx + t_bass) * mhh;
+        float p_mid_f  = mid  * win * sinf(2.0f * 3.14159265f * 2.5f * cx + t_mid ) * mhh;
+        float p_hmid_f = hmid * win * sinf(2.0f * 3.14159265f * 4.0f * cx + t_hmid) * mhh;
+        float p_high_f = high * win * sinf(2.0f * 3.14159265f * 6.5f * cx + t_high) * mhh;
+
+        for (int y = 0; y < H; y++) {
+            float dy_f = (float)(cy - y);
+
+            // Linear falloff from each wave's peak, scaled by Hann window.
+            // Linear (not quadratic) keeps the full glow width uniformly coloured —
+            // quadratic caused dark near-black pixels at the outer edge (the "black
+            // border").  Threshold clips the absolute dimmest outer fringe cleanly.
+            float g_bass = 0.0f, g_mid = 0.0f, g_hmid = 0.0f, g_high = 0.0f;
+            float d;
+            d = fabsf(dy_f - p_bass_f);
+            if (d < glow) { float t = (1.0f - d / glow) * win; g_bass = bass * t; }
+            d = fabsf(dy_f - p_mid_f);
+            if (d < glow) { float t = (1.0f - d / glow) * win; g_mid  = mid  * t; }
+            d = fabsf(dy_f - p_hmid_f);
+            if (d < glow) { float t = (1.0f - d / glow) * win; g_hmid = hmid * t; }
+            d = fabsf(dy_f - p_high_f);
+            if (d < glow) { float t = (1.0f - d / glow) * win; g_high = high * t; }
+
+            // Additive RGB — neon palette, vivid at crossings.
+            // bass=electric blue  mid=cyan-teal  hmid=lime-green  high=hot-pink
+            float fr = g_bass *  20 + g_mid *   0 + g_hmid * 120 + g_high * 255;
+            float fg = g_bass * 120 + g_mid * 255 + g_hmid * 255 + g_high *  40;
+            float fb = g_bass * 255 + g_mid * 220 + g_hmid *  20 + g_high * 230;
+
+            if (fr > 10.0f || fg > 10.0f || fb > 10.0f) {
+                uint8_t r8 = fr > 255.0f ? 255 : (uint8_t)fr;
+                uint8_t g8 = fg > 255.0f ? 255 : (uint8_t)fg;
+                uint8_t b8 = fb > 255.0f ? 255 : (uint8_t)fb;
+                lv_color_t c  = lv_color_make(r8, g8, b8);
+                uint8_t  *px  = s_wave_buf + ((size_t)(y * W + x)) * 3;
+                px[0] = (uint8_t)(c.full & 0xFF);  // RGB565 low byte
+                px[1] = (uint8_t)(c.full >> 8);    // RGB565 high byte
+                px[2] = 0xFF;                       // alpha = fully opaque
+            }
+        }
     }
 
     lv_obj_invalidate(s_wave_canvas);

@@ -131,11 +131,11 @@
 #define MIC_N_BARS         20       // number of waveform bars
 #define MIC_BAR_MS         80       // ms between bar advances (20 bars = 1.6 s window)
 
-// Waveform canvas dimensions (px).  Bars grow symmetrically from the centre line.
-// Width: 20 bars × (5 px bar + 3 px gap) − 3 px last gap = 157 px → fits in 160 px.
-// Height: bars peak at ±13 px from centre; 2 px margin top/bottom → 30 px total.
+// Waveform canvas dimensions (px).  Sine waves grow symmetrically from the centre line.
+// Width: 160 px — stays inside arc inner boundary (±96 px at canvas y level).
+// Height: 40 px — centre at y=20, max wave half-height ≈ 17 px (3 px margin each side).
 #define WAVE_CANVAS_W      160
-#define WAVE_CANVAS_H      30
+#define WAVE_CANVAS_H      56
 
 // ============================================================================
 // HAPTIC CONFIGURATION — DRV2605 on I2C_NUM_0 (shared with touch)
