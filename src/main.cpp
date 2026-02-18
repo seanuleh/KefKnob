@@ -20,6 +20,7 @@
 #include "drivers/display_sh8601.h"
 #include "drivers/touch_cst816.h"
 #include "drivers/encoder.h"
+#include "drivers/drv2605.h"
 #include "network/kef_api.h"
 #include "network/spotify_api.h"
 #include "ui/main_screen.h"
@@ -76,6 +77,9 @@ static volatile int  g_progress_pct   = 0;      // Track progress 0-100
 // consumed by Core 0 networkTask
 static volatile char g_control_cmd[16] = "";
 
+// Haptic event — written by Core 1 encoder callbacks and loop(), serviced in loop()
+static volatile uint8_t g_haptic_event = HAPTIC_NONE;
+
 // ============================================================================
 // Album art pipeline — Core 0 fetches JPEG, Core 1 decodes + blits
 //
@@ -104,6 +108,7 @@ void loop();
 void initSerial();
 void initDisplay();
 void initTouch();
+void initHaptic();
 void initEncoder();
 void initWiFi();
 void initOTA();
@@ -152,6 +157,10 @@ void setup() {
     DEBUG_PRINTLN("[INIT] Initializing touch controller...");
     initTouch();
     DEBUG_PRINTLN("[INIT] Touch initialized");
+
+    DEBUG_PRINTLN("[INIT] Initializing haptic driver...");
+    initHaptic();
+    DEBUG_PRINTLN("[INIT] Haptic driver initialized");
 
     DEBUG_PRINTLN("[INIT] Initializing rotary encoder...");
     initEncoder();
@@ -205,6 +214,7 @@ void loop() {
         const char *ctrl = main_screen_take_control_cmd();
         if (ctrl && ctrl[0] != '\0') {
             strncpy((char *)g_control_cmd, ctrl, sizeof(g_control_cmd) - 1);
+            g_haptic_event = HAPTIC_STRONG;  // power / source switch
         }
     }
 
@@ -213,6 +223,32 @@ void loop() {
         const char *track = main_screen_take_track_cmd();
         if (track && track[0] != '\0') {
             strncpy((char *)g_track_cmd, track, sizeof(g_track_cmd) - 1);
+            if (strcmp(track, "pause") == 0) {
+                g_haptic_event = HAPTIC_STRONG;  // play/pause — distinct feel
+            } else {
+                g_haptic_event = HAPTIC_MEDIUM;  // next/prev/mute/unmute
+            }
+        }
+    }
+
+    // --- Service haptic event (Core 1 only — I2C_NUM_0 shared with touch) ---
+    if (g_haptic_event != HAPTIC_NONE) {
+        uint8_t evt = g_haptic_event;
+        g_haptic_event = HAPTIC_NONE;
+        uint8_t effect;
+        switch (evt) {
+            case HAPTIC_STRONG: effect = HAPTIC_EFFECT_STRONG; break;
+            case HAPTIC_MEDIUM: effect = HAPTIC_EFFECT_MEDIUM; break;
+            default:            effect = HAPTIC_EFFECT_CLICK;  break;
+        }
+        // Rate-limit encoder clicks to reduce motor current spikes on the shared
+        // supply rail. Button events (STRONG/MEDIUM) always fire immediately.
+        static uint32_t last_click_ms = 0;
+        uint32_t now_ms = (uint32_t)millis();
+        bool is_click = (evt == HAPTIC_CLICK);
+        if (!is_click || (now_ms - last_click_ms >= HAPTIC_MIN_INTERVAL_MS)) {
+            drv2605_play(effect);
+            if (is_click) last_click_ms = now_ms;
         }
     }
 
@@ -268,6 +304,13 @@ void initTouch() {
     DEBUG_PRINTLN("[Touch] CST816S initialized");
 }
 
+void initHaptic() {
+    // I2C_NUM_0 is already installed by Touch_Init().
+    if (!drv2605_init()) {
+        DEBUG_PRINTLN("[Haptic] DRV2605 not found — haptics disabled");
+    }
+}
+
 // ---- Encoder callbacks ----
 
 static void encoder_left_cb(void *arg, void *data) {
@@ -276,6 +319,7 @@ static void encoder_left_cb(void *arg, void *data) {
     if (next < VOLUME_MIN) next = VOLUME_MIN;
     g_volume_target = next;
     g_volume_dirty = true;
+    g_haptic_event = HAPTIC_CLICK;
     DEBUG_PRINTF("[Encoder] Volume target: %d\n", next);
 }
 
@@ -285,6 +329,7 @@ static void encoder_right_cb(void *arg, void *data) {
     if (next > VOLUME_MAX) next = VOLUME_MAX;
     g_volume_target = next;
     g_volume_dirty = true;
+    g_haptic_event = HAPTIC_CLICK;
     DEBUG_PRINTF("[Encoder] Volume target: %d\n", next);
 }
 
@@ -522,6 +567,7 @@ void networkTask(void *pvParameters) {
 
     static uint32_t last_poll_ms   = 0;
     static bool     sp_is_playing  = false;  // Core 0 local — tracks Spotify play state
+    static bool     vol_known      = false;  // true after first successful kef_get_volume()
 
     // Client-side position estimation for KEF WiFi source (API has no position field)
     static uint32_t kef_track_dur_ms    = 0;     // duration from KEF status.duration
@@ -548,7 +594,7 @@ void networkTask(void *pvParameters) {
         // current target every 250ms while the encoder is turning (real-time
         // tracking) and within 250ms of stopping. Avoids the KEF rate-limit
         // that returns 0 if commands arrive faster than ~250ms apart.
-        if (g_volume_dirty && g_volume_target >= 0) {
+        if (vol_known && g_volume_dirty && g_volume_target >= 0) {
             uint32_t since_sent = now - volume_sent_ms;
             if (since_sent >= (uint32_t)VOLUME_DEBOUNCE_MS) {
                 g_volume_dirty = false;
@@ -750,6 +796,15 @@ void networkTask(void *pvParameters) {
                 int vol = 0;
                 if (kef_get_volume(&vol)) {
                     DEBUG_PRINTF("[KEF] Volume: %d\n", vol);
+                    if (!vol_known) {
+                        // First successful read — discard any encoder commands queued
+                        // before this point (they used g_volume=50 as a baseline, not
+                        // the real KEF volume, so they would set a wrong absolute level).
+                        vol_known      = true;
+                        g_volume_dirty = false;
+                        g_volume_target = -1;
+                        DEBUG_PRINTLN("[KEF] Volume baseline established — encoder commands enabled");
+                    }
                     if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                         g_volume = vol;
                         xSemaphoreGive(g_state_mutex);

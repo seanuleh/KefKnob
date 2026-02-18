@@ -123,6 +123,35 @@
 #define ALBUM_ART_MAX_JPEG   (256 * 1024) // Max JPEG bytes to allocate in PSRAM
 
 // ============================================================================
+// HAPTIC CONFIGURATION — DRV2605 on I2C_NUM_0 (shared with touch)
+// ============================================================================
+
+// Drive voltage — limits how hard the motor is driven by library effects.
+// Formula: V = register × 21.33 mV  (ERM unidirectional mode)
+//   0x60 ≈ 2.0 V RMS rated  — conservative, low current draw per pulse
+//   0x80 ≈ 2.7 V peak clamp — keeps inrush current modest on a shared rail
+// Increase if effects feel too weak; decrease if backlight dims on motor fire.
+#define HAPTIC_RATED_VOLTAGE  0x60
+#define HAPTIC_OD_CLAMP       0x80
+
+// Minimum interval between haptic pulses (ms).
+// Prevents rapid encoder spinning from firing a burst of current spikes that
+// sag the supply rail. Non-click events (buttons) always fire immediately.
+#define HAPTIC_MIN_INTERVAL_MS  80
+
+// Effect IDs for ERM Library A (library 1).  Adjust after testing with your motor.
+// Set an ID to 0 to silence that event.  Full table in TI DRV2605 datasheet.
+#define HAPTIC_EFFECT_CLICK   1    // Strong Click 100%  — encoder step
+#define HAPTIC_EFFECT_STRONG  14   // Sharp Click 100%   — play/pause, power on/off
+#define HAPTIC_EFFECT_MEDIUM  10   // Strong Click 60%   — next/prev, mute, source switch
+
+// Internal event codes (used between encoder callbacks and loop())
+#define HAPTIC_NONE    0
+#define HAPTIC_CLICK   1
+#define HAPTIC_STRONG  2
+#define HAPTIC_MEDIUM  3
+
+// ============================================================================
 // DEBUG CONFIGURATION
 // ============================================================================
 

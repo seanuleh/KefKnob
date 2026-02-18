@@ -11,7 +11,7 @@ KEF LSX II speaker controller running on a Waveshare ESP32-S3 1.8" Touch LCD.
 
 | What you want to change | File |
 |---|---|
-| Pin assignments, timeouts, task sizes, volume step, swipe threshold, OTA hostname/password | `include/config.h` |
+| Pin assignments, timeouts, task sizes, volume step, swipe threshold, OTA hostname/password, haptic effect IDs | `include/config.h` |
 | WiFi credentials, speaker IP, Spotify credentials (gitignored) | `include/config_local.h` |
 | LVGL settings (color depth, fonts, tick) | `include/lv_conf.h` |
 | Main screen UI layout, widget updates, button callbacks | `src/ui/main_screen.cpp` / `.h` |
@@ -21,6 +21,7 @@ KEF LSX II speaker controller running on a Waveshare ESP32-S3 1.8" Touch LCD.
 | Display hardware init (SH8601 QSPI) | `src/drivers/display_sh8601.cpp` / `.h` |
 | Touch hardware init (CST816S I2C) | `src/drivers/touch_cst816.cpp` / `.h` |
 | Encoder hardware init (iot_knob) — **C file, not C++** | `src/drivers/encoder.c` / `.h` |
+| DRV2605 haptic driver — **C file, not C++** | `src/drivers/drv2605.c` / `.h` |
 | SH8601 low-level LCD driver | `src/drivers/esp_lcd_sh8601.c` / `.h` |
 | Library dependencies, board config, partition table | `platformio.ini` |
 | Flash partition layout (OTA slots) | `partitions_ota.csv` |
@@ -61,6 +62,23 @@ const char *main_screen_take_track_cmd();
 // Returns one of: "pause" "next" "previous" "mute" "unmute"
 // Returns nullptr if no command pending. Clears the pending command.
 ```
+
+### `src/drivers/drv2605.h` — Core 1 only (I2C_NUM_0 shared with touch)
+
+```c
+bool drv2605_init(void);
+// Call once after Touch_Init(). Returns false if chip not found — all play() calls become no-ops.
+
+bool drv2605_play(uint8_t effect_id);
+// Trigger ERM Library A effect by ID (1-123). Returns false if busy or not init'd.
+// Skips silently if GO bit still set from previous effect.
+
+bool drv2605_is_playing(void);
+// True while GO bit is set.
+```
+
+Effect IDs and per-event mapping defined in `include/config.h` (`HAPTIC_EFFECT_*`, `HAPTIC_*`).
+Drive voltage maxed at init (`RATED_V=0xFF`, `OD_CLAMP=0xFF`). Scale back if motor overheats.
 
 ### `src/network/kef_api.h` — Core 0 (network task) only
 
@@ -130,14 +148,14 @@ Loops every 50ms                      ArduinoOTA.handle()
   │    WiFi:                          Forward button commands:
   │      kef_track_control()            main_screen_take_control_cmd() → g_control_cmd
   ├─ If g_control_cmd set:             main_screen_take_track_cmd()    → g_track_cmd
-  │    kef_set_source() / kef_set_power() On g_state_dirty: snapshot state
-  │    last_poll_ms = 0 (immediate re-poll) under mutex → main_screen_update()
-  └─ Every 1s:                                           main_screen_update_power_source()
-       kef_get_speaker_status()  ← standby detection
-       if USB source:
-         spotify_get_now_playing() → g_spotify_active, g_progress_pct
-       else:
-         kef_get_player_data()   → client-side progress estimation
+  │    kef_set_source() / kef_set_power() → sets g_haptic_event (STRONG/MEDIUM)
+  │    last_poll_ms = 0 (immediate re-poll) On g_state_dirty: snapshot state
+  └─ Every 1s:                          under mutex → main_screen_update()
+       kef_get_speaker_status()                       main_screen_update_power_source()
+       if USB source:                 Service g_haptic_event → drv2605_play()
+         spotify_get_now_playing()     (Core 1 only — I2C_NUM_0 shared with touch)
+       else:                          Encoder callbacks set g_haptic_event = CLICK
+         kef_get_player_data()
        kef_get_source()
        kef_get_volume() (skipped 3s after a set)
        g_state_dirty = true
@@ -151,6 +169,9 @@ Loops every 50ms                      ArduinoOTA.handle()
 ### Shared state globals (all in `src/main.cpp`)
 
 ```cpp
+// Haptic event — written by Core 1 encoder callbacks and loop(), serviced in loop()
+static volatile uint8_t g_haptic_event; // HAPTIC_NONE/CLICK/STRONG/MEDIUM (config.h)
+
 // Protected by g_state_mutex — read on Core 1, written on Core 0
 static int  g_volume;           // last confirmed volume from KEF
 static char g_title[128];       // current track title
@@ -449,6 +470,7 @@ while True:
 - No serial output at all → static large array allocated before `setup()`, or missing `-DARDUINO_USB_CDC_ON_BOOT=1` in `platformio.ini`
 - Wrong display colors → check `quad_mode = true` and byte-swap (see Display Gotchas)
 - Volume resets to 0 → KEF rate limit; ensure debounce + 3s poll cooldown are in place
+- Volume set to wrong value at boot → spurious encoder GPIO glitch during init using g_volume=50 as wrong baseline; the `vol_known` guard in networkTask prevents sending until first kef_get_volume() succeeds
 - LVGL crash / corruption → LVGL call made from Core 0 or ISR
 - Multiple definition of `setup` → two `.cpp` files in `src/` both defining `setup()`
 - RAM > 70% → move large allocations to PSRAM
@@ -462,4 +484,4 @@ while True:
 ---
 
 *Last updated: 2026-02-18*
-*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), track progress bar, Spotify API integration on USB (now-playing + playback control + progress), OTA firmware updates (ArduinoOTA via `deskknob.local`)*
+*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), track progress bar, Spotify API integration on USB (now-playing + playback control + progress), OTA firmware updates (ArduinoOTA via `deskknob.local`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent)*
