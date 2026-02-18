@@ -11,7 +11,7 @@ KEF LSX II speaker controller running on a Waveshare ESP32-S3 1.8" Touch LCD.
 
 | What you want to change | File |
 |---|---|
-| Pin assignments, timeouts, task sizes, volume step, swipe threshold, OTA hostname/password, haptic effect IDs | `include/config.h` |
+| Pin assignments, timeouts, task sizes, volume step, swipe threshold, OTA hostname/password, haptic effect IDs, mic pins, waveform bar count/timing | `include/config.h` |
 | WiFi credentials, speaker IP, Spotify credentials (gitignored) | `include/config_local.h` |
 | LVGL settings (color depth, fonts, tick) | `include/lv_conf.h` |
 | Main screen UI layout, widget updates, button callbacks | `src/ui/main_screen.cpp` / `.h` |
@@ -22,6 +22,7 @@ KEF LSX II speaker controller running on a Waveshare ESP32-S3 1.8" Touch LCD.
 | Touch hardware init (CST816S I2C) | `src/drivers/touch_cst816.cpp` / `.h` |
 | Encoder hardware init (iot_knob) — **C file, not C++** | `src/drivers/encoder.c` / `.h` |
 | DRV2605 haptic driver — **C file, not C++** | `src/drivers/drv2605.c` / `.h` |
+| PDM MEMS microphone (MSM261D4030H1CPM) I2S driver + mic task | `src/drivers/mic_pdm.cpp` / `.h` |
 | SH8601 low-level LCD driver | `src/drivers/esp_lcd_sh8601.c` / `.h` |
 | Library dependencies, board config, partition table | `platformio.ini` |
 | Flash partition layout (OTA slots) | `partitions_ota.csv` |
@@ -53,6 +54,11 @@ void main_screen_update_power_source(bool power_on, bool source_is_usb);
 void main_screen_toggle_control_panel();
 bool main_screen_is_control_panel_visible();
 bool main_screen_is_standby_visible();
+
+void main_screen_update_waveform(const uint8_t *levels, int count);
+// Redraws the 160×30 px waveform canvas. levels[0..count-1] are amplitudes
+// 0-255, oldest first. Bars grow symmetrically from the canvas centre line.
+// Call from Core 1 every MIC_BAR_MS ms (driven by loop()).
 
 const char *main_screen_take_control_cmd();
 // Returns one of: "power" "src_wifi" "src_usb" "pwr_wifi" "pwr_usb"
@@ -107,6 +113,24 @@ uint8_t *kef_fetch_jpeg(const char *url, size_t *out_size);
 // DEAD — do not call: kef_get_power() (HTTP 500), kef_power_on() (superseded by kef_set_power)
 ```
 
+### `src/drivers/mic_pdm.h` — mic task on Core 0, read on Core 1
+
+```cpp
+bool mic_pdm_init(int clk_pin, int data_pin);
+// Call once in setup() before initLVGL(). Opens I2S0 in PDM RX mode at 16 kHz
+// mono 16-bit using the hardware PDM2PCM filter (SOC_I2S_SUPPORTS_PDM2PCM=1 on
+// ESP32-S3). Spawns a FreeRTOS task on Core 0 (priority 4) that reads 512-sample
+// blocks, computes RMS, log-scales to 0-255, and smooths with fast attack /
+// slow decay. Returns false if I2S driver install fails.
+
+extern volatile uint8_t g_mic_level;
+// Smoothed amplitude 0-255. Written by mic task (~30 Hz, Core 0).
+// Single-byte volatile read from Core 1 is atomic on ESP32 — no mutex needed.
+```
+
+Microphone hardware: **MSM261D4030H1CPM** PDM MEMS mic.
+Pins: GPIO 45 (CLK / PDM SCK), GPIO 46 (DATA / PDM DIN). L/R tied to GND (left channel).
+
 ### `src/network/spotify_api.h` — Core 0 (network task) only
 
 ```cpp
@@ -136,10 +160,16 @@ bool spotify_previous();
 ## Architecture
 
 ```
-Core 0 — networkTask()                Core 1 — loop() / Arduino main
+Core 0 — networkTask() + mic task     Core 1 — loop() / Arduino main
 ──────────────────────────────────    ────────────────────────────────────
-Loops every 50ms                      ArduinoOTA.handle()
-  ├─ If g_volume_dirty AND            lv_timer_handler() every 5ms
+mic task (separate, priority 4):      ArduinoOTA.handle()
+  Reads I2S PDM ~30 Hz               lv_timer_handler() every 5ms
+  Updates g_mic_level (volatile u8)
+                                      Waveform update every MIC_BAR_MS (80ms):
+networkTask() — Loops every 50ms        reads g_mic_level, pushes to ring buf,
+  ├─ If g_volume_dirty AND               calls main_screen_update_waveform()
+  │    250ms since last send:         ArduinoOTA.handle()
+  │    kef_set_volume()               lv_timer_handler() every 5ms
   │    250ms since last send:           Reads g_volume_target → immediate
   │    kef_set_volume()                   arc redraw (no waiting)
   ├─ If g_track_cmd set:              Album art decode (g_art_dirty):
@@ -385,7 +415,7 @@ buf = (lv_color_t *)heap_caps_malloc(size, MALLOC_CAP_DMA);
 
 ### Main playback screen
 
-Layer order (back → front): art canvas → arc outline → arc → vol shadow labels → vol label → title pill → artist pill → progress bar outline → progress bar → playback buttons → control panel → standby screen
+Layer order (back → front): art canvas → arc outline → arc → vol shadow labels → vol label → title pill → artist pill → progress bar outline (hidden) → progress bar (hidden) → **waveform canvas** → playback buttons → control panel → standby screen
 
 **Layout (all positions are center-relative y offsets):**
 
@@ -396,8 +426,9 @@ Layer order (back → front): art canvas → arc outline → arc → vol shadow 
 | Volume number | CENTER, 0, -68 | Montserrat 40, blue #00BFFF, ±2px black outline |
 | Track title | CENTER, 0, -5 | Montserrat 20, dark pill, scrolls if >220px |
 | Artist name | CENTER, 0, +20 | Montserrat 16, dark pill, hidden when empty or USB+no-Spotify |
-| Progress bar outline | CENTER, 0, +81 | 206×16px, black — hidden on USB+no-Spotify |
-| Progress bar | CENTER, 0, +81 | 200×10px, blue #00BFFF fill, dark track — hidden on USB+no-Spotify |
+| Progress bar outline | CENTER, 0, +81 | 206×16px — **permanently hidden** (replaced by waveform) |
+| Progress bar | CENTER, 0, +81 | 200×10px — **permanently hidden** (replaced by waveform) |
+| Waveform canvas | CENTER, 0, +75 | 160×30px, 20 bars × 5px, driven by PDM mic in real time |
 | Playback buttons | CENTER, 0/±70, +126 | See state table below |
 
 **Per-source display state:**
@@ -480,8 +511,11 @@ while True:
 - Spotify playback control returning 403 → Spotify Premium required; verify `user-modify-playback-state` scope
 - Spotify 401 in logs → refresh token invalid or scope missing; re-run auth script
 - OTA upload failing → device must be on WiFi and booted; use hostname `deskknob.local` or set IP directly in `platformio.ini`
+- Waveform always flat → check serial for `[Mic] PDM init failed` — I2S0 may be in use by another driver, or GPIO 45/46 are in use
+- Waveform jumpy/noisy → tune `MIC_BAR_MS` (slower) or tighten the decay constant in `mic_pdm.cpp`
+- Waveform bars don't respond to music → the mic picks up ambient room sound; move DeskKnob closer to speakers or increase speaker volume
 
 ---
 
 *Last updated: 2026-02-18*
-*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), track progress bar, Spotify API integration on USB (now-playing + playback control + progress), OTA firmware updates (ArduinoOTA via `deskknob.local`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent)*
+*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), Spotify API integration on USB (now-playing + playback control + progress), OTA firmware updates (ArduinoOTA via `deskknob.local`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent), **real-time mic waveform visualiser** (replaces progress bar — MSM261D4030H1CPM PDM MEMS mic → I2S0 PDM RX → 20-bar animated waveform driven by ambient sound)*

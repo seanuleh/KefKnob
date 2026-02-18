@@ -123,6 +123,21 @@
 #define ALBUM_ART_MAX_JPEG   (256 * 1024) // Max JPEG bytes to allocate in PSRAM
 
 // ============================================================================
+// MICROPHONE CONFIGURATION — PDM MEMS mic (MSM261D4030H1CPM) on I2S0
+// ============================================================================
+
+#define MIC_PDM_CLK_PIN    45       // PDM clock  GPIO (WS in I2S PDM RX mode)
+#define MIC_PDM_DATA_PIN   46       // PDM data   GPIO (DIN)
+#define MIC_N_BARS         20       // number of waveform bars
+#define MIC_BAR_MS         80       // ms between bar advances (20 bars = 1.6 s window)
+
+// Waveform canvas dimensions (px).  Bars grow symmetrically from the centre line.
+// Width: 20 bars × (5 px bar + 3 px gap) − 3 px last gap = 157 px → fits in 160 px.
+// Height: bars peak at ±13 px from centre; 2 px margin top/bottom → 30 px total.
+#define WAVE_CANVAS_W      160
+#define WAVE_CANVAS_H      30
+
+// ============================================================================
 // HAPTIC CONFIGURATION — DRV2605 on I2C_NUM_0 (shared with touch)
 // ============================================================================
 

@@ -67,3 +67,10 @@ const char *main_screen_take_control_cmd();
  * Must be called only from Core 1.
  */
 const char *main_screen_take_track_cmd();
+
+/**
+ * Redraw the waveform visualiser with amplitude history.
+ * levels[0] is the oldest sample, levels[count-1] the newest (0–255 each).
+ * count should equal MIC_N_BARS from config.h.  Core 1 only.
+ */
+void main_screen_update_waveform(const uint8_t *levels, int count);

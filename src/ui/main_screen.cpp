@@ -15,8 +15,12 @@ static lv_obj_t *s_vol_shadow[4]   = {};   // outline: 4 cardinal-offset black l
 static lv_obj_t *s_vol_label       = NULL;
 static lv_obj_t *s_title_label      = NULL;
 static lv_obj_t *s_artist_label     = NULL;
-static lv_obj_t *s_progress_outline = NULL;  // black border bar behind progress
-static lv_obj_t *s_progress_bar     = NULL;  // Spotify-green fill bar
+static lv_obj_t *s_progress_outline = NULL;  // kept but hidden (replaced by waveform)
+static lv_obj_t *s_progress_bar     = NULL;  // kept but hidden (replaced by waveform)
+
+// Waveform visualiser — driven by microphone amplitude in real time
+static lv_obj_t *s_wave_canvas = NULL;
+static uint8_t  *s_wave_buf    = NULL;  // WAVE_CANVAS_W × WAVE_CANVAS_H × 2 bytes (RGB565)
 
 // Bottom playback control buttons (created on s_screen, below overlays)
 static lv_obj_t *s_btn_mute      = NULL;  // USB source: mute toggle (center)
@@ -290,6 +294,30 @@ void main_screen_create() {
     lv_obj_set_style_bg_color(s_progress_bar, lv_color_hex(0x00BFFF), LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(s_progress_bar, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_clear_flag(s_progress_bar, LV_OBJ_FLAG_CLICKABLE);
+    // Both progress bar objects are permanently hidden — replaced by the
+    // waveform canvas below.  Kept as objects so existing update logic compiles.
+    lv_obj_add_flag(s_progress_outline, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_progress_bar,     LV_OBJ_FLAG_HIDDEN);
+
+    // ---- [5b] Waveform visualiser canvas — mic-driven, replaces progress bar ----
+    // Canvas: WAVE_CANVAS_W × WAVE_CANVAS_H px, RGB565, in internal SRAM.
+    // Layer order: sits directly above the progress bar objects (already hidden).
+    // Bars grow symmetrically from the vertical centre, oldest bar on the left.
+    s_wave_buf = (uint8_t *)malloc((size_t)WAVE_CANVAS_W * WAVE_CANVAS_H * sizeof(uint16_t));
+    if (s_wave_buf) {
+        s_wave_canvas = lv_canvas_create(s_screen);
+        lv_canvas_set_buffer(s_wave_canvas, s_wave_buf,
+                             WAVE_CANVAS_W, WAVE_CANVAS_H, LV_IMG_CF_TRUE_COLOR);
+        lv_obj_set_size(s_wave_canvas, WAVE_CANVAS_W, WAVE_CANVAS_H);
+        // y=+75: canvas spans +60..+90 from display centre.
+        // Arc endpoints are at +70 (arc ends there), so the top few rows of
+        // the canvas lie inside the arc gap — no visual overlap.
+        lv_obj_align(s_wave_canvas, LV_ALIGN_CENTER, 0, 75);
+        lv_obj_set_style_bg_opa(s_wave_canvas, LV_OPA_TRANSP, 0);
+        lv_obj_clear_flag(s_wave_canvas, LV_OBJ_FLAG_CLICKABLE);
+        lv_canvas_fill_bg(s_wave_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+        lv_obj_add_flag(s_wave_canvas, LV_OBJ_FLAG_HIDDEN);  // shown on first update
+    }
 
     // ---- [6] Bottom playback buttons ----
     // Round icon-only buttons. Visibility toggled in main_screen_update().
@@ -499,17 +527,14 @@ void main_screen_update(int volume, const char *title,
         lv_label_set_text_fmt(s_vol_shadow[i], "%d", volume);
     }
 
-    // Track progress bar — hidden on USB when Spotify is not active
-    bool show_progress = !source_is_usb || spotify_active;
-    if (show_progress) {
-        int pct = (progress_pct < 0) ? 0 : (progress_pct > 100) ? 100 : progress_pct;
-        lv_bar_set_value(s_progress_outline, pct, LV_ANIM_OFF);
-        lv_bar_set_value(s_progress_bar,     pct, LV_ANIM_OFF);
-        lv_obj_clear_flag(s_progress_outline, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_progress_bar,     LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(s_progress_outline, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_progress_bar,     LV_OBJ_FLAG_HIDDEN);
+    // Progress bars are permanently hidden — replaced by the waveform canvas.
+    // (Already hidden in main_screen_create; kept here defensively.)
+    lv_obj_add_flag(s_progress_outline, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_progress_bar,     LV_OBJ_FLAG_HIDDEN);
+
+    // Waveform canvas: reveal on first state update (stays visible thereafter).
+    if (s_wave_canvas) {
+        lv_obj_clear_flag(s_wave_canvas, LV_OBJ_FLAG_HIDDEN);
     }
 
     // Show correct button set and update state-dependent icons
@@ -585,6 +610,53 @@ void main_screen_update_art(const uint8_t *jpeg_buf, size_t jpeg_size) {
     lv_obj_invalidate(s_art_canvas);
 
     DEBUG_PRINTLN("[Art] Background canvas updated");
+}
+
+// ---------------------------------------------------------------------------
+// main_screen_update_waveform
+//
+// Redraws the waveform canvas with 'count' amplitude bars (0–255 each).
+// Bars grow symmetrically from the canvas centre line, oldest bar on the left.
+// Called from Core 1 every MIC_BAR_MS ms by loop().
+// ---------------------------------------------------------------------------
+
+void main_screen_update_waveform(const uint8_t *levels, int count) {
+    if (!s_wave_canvas || !s_wave_buf || !levels || count <= 0) return;
+
+    // Clear canvas to solid black background.
+    lv_canvas_fill_bg(s_wave_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.bg_color     = lv_color_hex(0x00BFFF);
+    dsc.bg_opa       = LV_OPA_COVER;
+    dsc.radius       = 2;           // slightly rounded bar ends
+    dsc.border_width = 0;
+    dsc.shadow_width = 0;
+
+    // Bar geometry (must match WAVE_CANVAS_W / MIC_N_BARS in config.h)
+    const int bar_w   = 5;
+    const int gap     = 3;
+    const int step    = bar_w + gap;   // 8 px per slot
+    const int ch      = WAVE_CANVAS_H; // 30
+    const int cy      = ch / 2;        // 15 — centre line
+    const int max_hh  = cy - 2;        // 13 — max half-height (2 px margin)
+    const int min_hh  = 1;             // 1  — half-height at silence
+
+    // Centre all bars horizontally within the canvas.
+    // total bar-span = count * step - gap (omit trailing gap)
+    int total_w = count * step - gap;
+    int margin  = (WAVE_CANVAS_W - total_w) / 2;  // ≈ 1 px for 20 bars
+
+    for (int i = 0; i < count; i++) {
+        int hh    = min_hh + ((int)levels[i] * (max_hh - min_hh)) / 255;
+        int bar_h = hh * 2;
+        int x     = margin + i * step;
+        int y     = cy - hh;
+        lv_canvas_draw_rect(s_wave_canvas, x, y, bar_w, bar_h, &dsc);
+    }
+
+    lv_obj_invalidate(s_wave_canvas);
 }
 
 // ---------------------------------------------------------------------------

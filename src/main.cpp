@@ -21,6 +21,7 @@
 #include "drivers/touch_cst816.h"
 #include "drivers/encoder.h"
 #include "drivers/drv2605.h"
+#include "drivers/mic_pdm.h"
 #include "network/kef_api.h"
 #include "network/spotify_api.h"
 #include "ui/main_screen.h"
@@ -110,6 +111,7 @@ void initDisplay();
 void initTouch();
 void initHaptic();
 void initEncoder();
+void initMic();
 void initWiFi();
 void initOTA();
 void initLVGL();
@@ -165,6 +167,10 @@ void setup() {
     DEBUG_PRINTLN("[INIT] Initializing rotary encoder...");
     initEncoder();
     DEBUG_PRINTLN("[INIT] Encoder initialized");
+
+    DEBUG_PRINTLN("[INIT] Initializing microphone...");
+    initMic();
+    DEBUG_PRINTLN("[INIT] Microphone initialized");
 
     DEBUG_PRINTLN("[INIT] Initializing LVGL...");
     DEBUG_PRINTF("[INIT] Free heap before LVGL: %d bytes\n", ESP.getFreeHeap());
@@ -249,6 +255,31 @@ void loop() {
         if (!is_click || (now_ms - last_click_ms >= HAPTIC_MIN_INTERVAL_MS)) {
             drv2605_play(effect);
             if (is_click) last_click_ms = now_ms;
+        }
+    }
+
+    // --- Waveform visualiser: push a new bar every MIC_BAR_MS ms ---
+    // Core 1 owns the history ring buffer. g_mic_level is written by the mic
+    // task on Core 0 and read here as a volatile uint8_t (atomic on ESP32).
+    {
+        static uint32_t last_wave_ms      = 0;
+        static uint8_t  wave_hist[MIC_N_BARS] = {};
+        static int      wave_head         = 0;   // index of the oldest sample
+
+        uint32_t now_wave = (uint32_t)millis();
+        if (g_power_on && now_wave - last_wave_ms >= (uint32_t)MIC_BAR_MS) {
+            last_wave_ms = now_wave;
+
+            // Push newest amplitude into the ring buffer.
+            wave_hist[wave_head] = g_mic_level;
+            wave_head = (wave_head + 1) % MIC_N_BARS;
+
+            // Linearise ring buffer: index 0 = oldest, [MIC_N_BARS-1] = newest.
+            uint8_t ordered[MIC_N_BARS];
+            for (int i = 0; i < MIC_N_BARS; i++) {
+                ordered[i] = wave_hist[(wave_head + i) % MIC_N_BARS];
+            }
+            main_screen_update_waveform(ordered, MIC_N_BARS);
         }
     }
 
@@ -348,6 +379,15 @@ void initEncoder() {
     iot_knob_register_cb(encoder_handle, KNOB_LEFT,  encoder_left_cb,  NULL);
     iot_knob_register_cb(encoder_handle, KNOB_RIGHT, encoder_right_cb, NULL);
     DEBUG_PRINTLN("[Encoder] Rotary encoder initialized");
+}
+
+void initMic() {
+    if (!mic_pdm_init(MIC_PDM_CLK_PIN, MIC_PDM_DATA_PIN)) {
+        DEBUG_PRINTLN("[Mic] PDM init failed — waveform will be flat");
+    } else {
+        DEBUG_PRINTF("[Mic] PDM mic ready on GPIO %d (CLK) / %d (DATA)\n",
+                     MIC_PDM_CLK_PIN, MIC_PDM_DATA_PIN);
+    }
 }
 
 void initWiFi() {
