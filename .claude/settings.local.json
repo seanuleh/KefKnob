@@ -17,7 +17,8 @@
       "Bash(python3:*)",
       "WebFetch(domain:www.home-assistant.io)",
       "WebFetch(domain:gist.github.com)",
-      "Bash(pio pkg search:*)"
+      "Bash(pio pkg search:*)",
+      "Bash(ssh:*)"
     ]
   }
 }
