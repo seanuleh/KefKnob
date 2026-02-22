@@ -632,33 +632,54 @@ void lvgl_touch_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
             int16_t dx = (int16_t)touch_last_x - (int16_t)touch_start_x;
             int16_t dy = (int16_t)touch_last_y - (int16_t)touch_start_y;
 
-            // Standby screen: let LVGL handle button taps; suppress all gestures
-            if (main_screen_is_standby_visible()) {
-                was_pressed = false;
-                data->state = LV_INDEV_STATE_REL;
-                return;
-            }
-
             bool horiz_swipe = (abs(dx) >= SWIPE_THRESHOLD && abs(dx) >= abs(dy));
             bool vert_swipe  = (abs(dy) >= SWIPE_THRESHOLD && abs(dy) >  abs(dx));
             bool from_top    = (touch_start_y < LCD_HEIGHT / 3);
 
+            // Standby screen: suppress non-horizontal gestures (control panel, etc.)
+            // so the WiFi/USB wake buttons can be tapped cleanly.
+            // Only applies while we are actually on the KEF screen — once the user
+            // has swiped to the light screen the standby overlay is not visible and
+            // all gestures should work normally.
+            if (main_screen_is_standby_visible() && g_active_screen == SCREEN_KEF) {
+                if (!horiz_swipe) {
+                    was_pressed = false;
+                    data->state = LV_INDEV_STATE_REL;
+                    return;
+                }
+            }
+
             if (horiz_swipe && !light_screen_is_colorpicker_open()) {
                 if (g_active_screen == SCREEN_KEF && dx < 0) {
-                    // Swipe left → light screen slides in from the right
+                    // Swipe left from KEF → light screen slides in from the right
                     g_active_screen     = SCREEN_LIGHT;
                     g_encoder_mode      = light_screen_get_encoder_mode();
-                    g_light_state_dirty = true;  // ensure light_screen_update() fires on entry
+                    g_light_state_dirty = true;
                     lv_scr_load_anim(light_screen_get_obj(),
                                      LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
                     DEBUG_PRINTLN("[Touch] Swipe left → light screen");
                 } else if (g_active_screen == SCREEN_LIGHT && dx > 0) {
-                    // Swipe right → KEF screen slides back in from the left
+                    // Swipe right from light → KEF screen slides in from the left
                     g_active_screen = SCREEN_KEF;
                     g_encoder_mode  = ENCODER_MODE_KEF_VOLUME;
                     lv_scr_load_anim(main_screen_get_obj(),
                                      LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
                     DEBUG_PRINTLN("[Touch] Swipe right → KEF screen");
+                } else if (g_active_screen == SCREEN_KEF && dx > 0) {
+                    // Swipe right from KEF (wrap) → light screen slides in from the left
+                    g_active_screen     = SCREEN_LIGHT;
+                    g_encoder_mode      = light_screen_get_encoder_mode();
+                    g_light_state_dirty = true;
+                    lv_scr_load_anim(light_screen_get_obj(),
+                                     LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+                    DEBUG_PRINTLN("[Touch] Swipe right (wrap) → light screen");
+                } else if (g_active_screen == SCREEN_LIGHT && dx < 0) {
+                    // Swipe left from light (wrap) → KEF screen slides in from the right
+                    g_active_screen = SCREEN_KEF;
+                    g_encoder_mode  = ENCODER_MODE_KEF_VOLUME;
+                    lv_scr_load_anim(main_screen_get_obj(),
+                                     LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+                    DEBUG_PRINTLN("[Touch] Swipe left (wrap) → KEF screen");
                 }
             } else if (vert_swipe && from_top && dy > 0 && g_active_screen == SCREEN_KEF) {
                 // Slide from top down → toggle control panel (KEF screen only)
