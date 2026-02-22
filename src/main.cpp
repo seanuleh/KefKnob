@@ -24,7 +24,9 @@
 #include "drivers/mic_pdm.h"
 #include "network/kef_api.h"
 #include "network/spotify_api.h"
+#include "network/mqtt_client.h"
 #include "ui/main_screen.h"
+#include "ui/light_screen.h"
 
 // ============================================================================
 // LVGL display buffers
@@ -80,6 +82,20 @@ static volatile char g_control_cmd[16] = "";
 
 // Haptic event — written by Core 1 encoder callbacks and loop(), serviced in loop()
 static volatile uint8_t g_haptic_event = HAPTIC_NONE;
+
+// ============================================================================
+// Light screen / multi-screen state (all Core 1 only — same core, no mutex)
+// ============================================================================
+
+static volatile int  g_encoder_mode            = ENCODER_MODE_KEF_VOLUME;
+static volatile int  g_active_screen           = SCREEN_KEF;
+
+// Light encoder targets — written by Core 1 encoder callbacks, consumed by Core 0
+static volatile int  g_light_brightness_target = -1;  // -1 = none pending
+static volatile int  g_light_colortemp_target  = -1;
+
+// Light button/colorwheel commands — written by Core 1 (loop), consumed by Core 0
+static volatile char g_light_cmd[192] = "";
 
 // ============================================================================
 // Album art pipeline — Core 0 fetches JPEG, Core 1 decodes + blits
@@ -237,6 +253,33 @@ void loop() {
         }
     }
 
+    // --- Forward light screen button/colorwheel commands to networkTask ---
+    {
+        const char *lcmd = light_screen_take_cmd();
+        if (lcmd && lcmd[0] != '\0') {
+            strncpy((char *)g_light_cmd, lcmd, sizeof(g_light_cmd) - 1);
+            // Power toggle gets a strong pulse; colour/mode cmds get medium
+            g_haptic_event = (strstr(lcmd, "TOGGLE") != nullptr)
+                             ? HAPTIC_STRONG : HAPTIC_MEDIUM;
+        }
+    }
+
+    // --- Light screen: sync encoder mode and redraw on state/target change ---
+    if (g_active_screen == SCREEN_LIGHT) {
+        // Sync encoder mode from button state (buttons update internal mode on tap)
+        g_encoder_mode = light_screen_get_encoder_mode();
+
+        bool bri_pending = (g_light_brightness_target >= 0);
+        bool ct_pending  = (g_light_colortemp_target  >= 0);
+        if (bri_pending || ct_pending || g_light_state_dirty) {
+            g_light_state_dirty = false;
+            int bri = bri_pending ? (int)g_light_brightness_target : (int)g_light_brightness;
+            int ct  = ct_pending  ? (int)g_light_colortemp_target  : (int)g_light_colortemp;
+            light_screen_update((bool)g_light_on, bri, ct,
+                                g_light_color_hue, g_light_color_sat);
+        }
+    }
+
     // --- Service haptic event (Core 1 only — I2C_NUM_0 shared with touch) ---
     if (g_haptic_event != HAPTIC_NONE) {
         uint8_t evt = g_haptic_event;
@@ -344,25 +387,44 @@ void initHaptic() {
 
 // ---- Encoder callbacks ----
 
-static void encoder_left_cb(void *arg, void *data) {
-    int v = (g_volume_target < 0) ? g_volume : (int)g_volume_target;
-    int next = v - VOLUME_STEP;
-    if (next < VOLUME_MIN) next = VOLUME_MIN;
-    g_volume_target = next;
-    g_volume_dirty = true;
+static void handle_encoder_delta(int delta) {
     g_haptic_event = HAPTIC_CLICK;
-    DEBUG_PRINTF("[Encoder] Volume target: %d\n", next);
+    switch (g_encoder_mode) {
+        case ENCODER_MODE_KEF_VOLUME: {
+            int v = (g_volume_target < 0) ? g_volume : (int)g_volume_target;
+            int next = v + delta * VOLUME_STEP;
+            if (next < VOLUME_MIN) next = VOLUME_MIN;
+            if (next > VOLUME_MAX) next = VOLUME_MAX;
+            g_volume_target = next;
+            g_volume_dirty  = true;
+            DEBUG_PRINTF("[Encoder] Volume target: %d\n", next);
+            break;
+        }
+        case ENCODER_MODE_LIGHT_BRIGHT: {
+            int cur = (g_light_brightness_target >= 0)
+                      ? g_light_brightness_target : (int)g_light_brightness;
+            int nxt = cur + delta * LIGHT_BRIGHTNESS_STEP;
+            if (nxt < LIGHT_BRIGHTNESS_MIN) nxt = LIGHT_BRIGHTNESS_MIN;
+            if (nxt > LIGHT_BRIGHTNESS_MAX) nxt = LIGHT_BRIGHTNESS_MAX;
+            g_light_brightness_target = nxt;
+            DEBUG_PRINTF("[Encoder] Brightness target: %d\n", nxt);
+            break;
+        }
+        case ENCODER_MODE_LIGHT_COLORTEMP: {
+            int cur = (g_light_colortemp_target >= 0)
+                      ? g_light_colortemp_target : (int)g_light_colortemp;
+            int nxt = cur + delta * LIGHT_COLORTEMP_STEP;
+            if (nxt < LIGHT_COLORTEMP_MIN) nxt = LIGHT_COLORTEMP_MIN;
+            if (nxt > LIGHT_COLORTEMP_MAX) nxt = LIGHT_COLORTEMP_MAX;
+            g_light_colortemp_target = nxt;
+            DEBUG_PRINTF("[Encoder] ColorTemp target: %d\n", nxt);
+            break;
+        }
+    }
 }
 
-static void encoder_right_cb(void *arg, void *data) {
-    int v = (g_volume_target < 0) ? g_volume : (int)g_volume_target;
-    int next = v + VOLUME_STEP;
-    if (next > VOLUME_MAX) next = VOLUME_MAX;
-    g_volume_target = next;
-    g_volume_dirty = true;
-    g_haptic_event = HAPTIC_CLICK;
-    DEBUG_PRINTF("[Encoder] Volume target: %d\n", next);
-}
+static void encoder_left_cb(void *arg, void *data)  { handle_encoder_delta(-1); }
+static void encoder_right_cb(void *arg, void *data) { handle_encoder_delta(+1); }
 
 void initEncoder() {
     knob_config_t cfg = {
@@ -480,8 +542,11 @@ void initLVGL() {
 
     // Main application screen
     main_screen_create();
-
     DEBUG_PRINTLN("[LVGL] Main screen created");
+
+    // Light control screen (built but not loaded — switching via swipe gestures)
+    light_screen_create();
+    DEBUG_PRINTLN("[LVGL] Light screen created");
 }
 
 void createTasks() {
@@ -571,11 +636,24 @@ void lvgl_touch_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
             bool vert_swipe  = (abs(dy) >= SWIPE_THRESHOLD && abs(dy) >  abs(dx));
             bool from_top    = (touch_start_y < LCD_HEIGHT / 3);
 
-            if (horiz_swipe) {
-                // TODO: navigate between screens (swipe left/right)
-                DEBUG_PRINTLN("[Touch] Horizontal swipe (reserved: screen navigation)");
-            } else if (vert_swipe && from_top && dy > 0) {
-                // Slide from top down → toggle control panel
+            if (horiz_swipe && !light_screen_is_colorpicker_open()) {
+                if (g_active_screen == SCREEN_KEF && dx < 0) {
+                    // Swipe left → light screen slides in from the right
+                    g_active_screen = SCREEN_LIGHT;
+                    g_encoder_mode  = light_screen_get_encoder_mode();
+                    lv_scr_load_anim(light_screen_get_obj(),
+                                     LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+                    DEBUG_PRINTLN("[Touch] Swipe left → light screen");
+                } else if (g_active_screen == SCREEN_LIGHT && dx > 0) {
+                    // Swipe right → KEF screen slides back in from the left
+                    g_active_screen = SCREEN_KEF;
+                    g_encoder_mode  = ENCODER_MODE_KEF_VOLUME;
+                    lv_scr_load_anim(main_screen_get_obj(),
+                                     LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+                    DEBUG_PRINTLN("[Touch] Swipe right → KEF screen");
+                }
+            } else if (vert_swipe && from_top && dy > 0 && g_active_screen == SCREEN_KEF) {
+                // Slide from top down → toggle control panel (KEF screen only)
                 main_screen_toggle_control_panel();
                 DEBUG_PRINTLN("[Touch] Swipe down from top → control panel");
             } else if (main_screen_is_control_panel_visible()) {
@@ -604,6 +682,7 @@ void networkTask(void *pvParameters) {
     DEBUG_PRINTLN("[Network Task] Started on Core 0");
 
     spotify_init(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN);
+    mqtt_client_begin(MQTT_BROKER_IP, MQTT_BROKER_PORT);
 
     static uint32_t last_poll_ms   = 0;
     static bool     sp_is_playing  = false;  // Core 0 local — tracks Spotify play state
@@ -628,6 +707,44 @@ void networkTask(void *pvParameters) {
         }
 
         uint32_t now = (uint32_t)millis();
+
+        // --- MQTT: maintain connection + process incoming messages ---
+        mqtt_client_loop();
+
+        // --- Publish brightness (debounced) ---
+        if (g_light_brightness_target >= 0) {
+            static uint32_t last_bri_ms = 0;
+            if (now - last_bri_ms >= (uint32_t)LIGHT_DEBOUNCE_MS) {
+                int t = g_light_brightness_target;
+                g_light_brightness_target = -1;
+                char p[48];
+                snprintf(p, sizeof(p), "{\"brightness\":%d}", t);
+                if (mqtt_light_publish(p)) g_light_brightness = t;
+                last_bri_ms = now;
+            }
+        }
+
+        // --- Publish colour temp (debounced) ---
+        if (g_light_colortemp_target >= 0) {
+            static uint32_t last_ct_ms = 0;
+            if (now - last_ct_ms >= (uint32_t)LIGHT_DEBOUNCE_MS) {
+                int t = g_light_colortemp_target;
+                g_light_colortemp_target = -1;
+                char p[48];
+                snprintf(p, sizeof(p), "{\"color_temp\":%d}", t);
+                if (mqtt_light_publish(p)) g_light_colortemp = t;
+                last_ct_ms = now;
+            }
+        }
+
+        // --- Publish power toggle / colour commands from button/colorwheel ---
+        if (g_light_cmd[0] != '\0') {
+            char cmd[192];
+            strncpy(cmd, (const char *)g_light_cmd, sizeof(cmd) - 1);
+            cmd[sizeof(cmd) - 1] = '\0';
+            g_light_cmd[0] = '\0';
+            mqtt_light_publish(cmd);
+        }
 
         // --- Pending volume command ---
         // Gate on time-since-last-SEND, not time-since-last-tick. This sends the

@@ -26,6 +26,32 @@
 // NETWORK CONFIGURATION
 // ============================================================================
 
+// MQTT broker (set MQTT_BROKER_IP in config_local.h, e.g. "192.168.1.99")
+#ifndef MQTT_BROKER_IP
+#  define MQTT_BROKER_IP  ""     // empty = MQTT disabled
+#endif
+#define MQTT_BROKER_PORT      1883
+#define MQTT_LIGHT_TOPIC      "zigbee2mqtt/Sean's Office Light"
+#define MQTT_LIGHT_SET_TOPIC  "zigbee2mqtt/Sean's Office Light/set"
+
+// Light encoder controls
+#define LIGHT_BRIGHTNESS_MIN    0
+#define LIGHT_BRIGHTNESS_MAX    254
+#define LIGHT_BRIGHTNESS_STEP   3
+#define LIGHT_COLORTEMP_MIN     153    // Mired (~6500 K)
+#define LIGHT_COLORTEMP_MAX     500    // Mired (~2000 K)
+#define LIGHT_COLORTEMP_STEP    10
+#define LIGHT_DEBOUNCE_MS       150    // ms between MQTT publishes while encoder spins
+
+// Encoder mode constants
+#define ENCODER_MODE_KEF_VOLUME      0
+#define ENCODER_MODE_LIGHT_BRIGHT    1
+#define ENCODER_MODE_LIGHT_COLORTEMP 2
+
+// Screen indices
+#define SCREEN_KEF    0
+#define SCREEN_LIGHT  1
+
 // OTA
 #define OTA_HOSTNAME "deskknob"
 // #define OTA_PASSWORD "changeme"  // Uncomment to require a password

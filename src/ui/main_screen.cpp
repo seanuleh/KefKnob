@@ -810,6 +810,8 @@ const char *main_screen_take_control_cmd() {
     return out;
 }
 
+lv_obj_t *main_screen_get_obj() { return s_screen; }
+
 const char *main_screen_take_track_cmd() {
     if (s_pending_track_cmd[0] == '\0') return nullptr;
     static char out[12];

@@ -69,6 +69,11 @@ const char *main_screen_take_control_cmd();
 const char *main_screen_take_track_cmd();
 
 /**
+ * Returns the underlying lv_obj_t* for lv_scr_load_anim transitions.
+ */
+lv_obj_t *main_screen_get_obj();
+
+/**
  * Redraw the waveform visualiser with amplitude history.
  * levels[0] is the oldest sample, levels[count-1] the newest (0–255 each).
  * count should equal MIC_N_BARS from config.h.  Core 1 only.

@@ -24,6 +24,8 @@ KEF LSX II speaker controller running on a Waveshare ESP32-S3 1.8" Touch LCD.
 | DRV2605 haptic driver — **C file, not C++** | `src/drivers/drv2605.c` / `.h` |
 | PDM MEMS microphone (MSM261D4030H1CPM) I2S driver + mic task | `src/drivers/mic_pdm.cpp` / `.h` |
 | SH8601 low-level LCD driver | `src/drivers/esp_lcd_sh8601.c` / `.h` |
+| MQTT PubSubClient wrapper (Zigbee2MQTT light control) | `src/network/mqtt_client.cpp` / `.h` |
+| Hue light control screen (LVGL) | `src/ui/light_screen.cpp` / `.h` |
 | Library dependencies, board config, partition table | `platformio.ini` |
 | Flash partition layout (OTA slots) | `partitions_ota.csv` |
 
@@ -131,6 +133,49 @@ extern volatile uint8_t g_mic_level;
 Microphone hardware: **MSM261D4030H1CPM** PDM MEMS mic.
 Pins: GPIO 45 (CLK / PDM SCK), GPIO 46 (DATA / PDM DIN). L/R tied to GND (left channel).
 
+### `src/network/mqtt_client.h` — Core 0 (network task) only
+
+```cpp
+// Volatile light state — written by Core 0 MQTT callback, read by Core 1
+extern volatile bool  g_light_on;
+extern volatile int   g_light_brightness;   // 0–254
+extern volatile int   g_light_colortemp;    // Mired 153–500
+extern volatile float g_light_color_hue;    // 0–360
+extern volatile float g_light_color_sat;    // 0–100
+extern volatile bool  g_light_state_dirty;  // Core 0 → Core 1 paint signal
+
+void mqtt_client_begin(const char *broker_ip, int port);
+// Connect to broker, subscribe to MQTT_LIGHT_TOPIC.
+// No-op if MQTT_BROKER_IP is empty.
+
+void mqtt_client_loop();
+// Process incoming messages, reconnect every 5s if disconnected.
+// Call every networkTask iteration.
+
+bool mqtt_light_publish(const char *json_payload);
+// Publish to MQTT_LIGHT_SET_TOPIC.  Returns false if disconnected.
+```
+
+Broker IP / port: `MQTT_BROKER_IP` / `MQTT_BROKER_PORT` in `include/config.h` (set in `config_local.h`).
+Topic constants: `MQTT_LIGHT_TOPIC` (subscribe), `MQTT_LIGHT_SET_TOPIC` (publish).
+
+### `src/ui/light_screen.h` — Core 1 only
+
+```cpp
+lv_obj_t  *light_screen_get_obj();
+void        light_screen_create();
+void        light_screen_update(bool on, int brightness, int colortemp,
+                                float hue, float sat);
+const char *light_screen_take_cmd();        // JSON payload for MQTT /set, clears on read
+int         light_screen_get_encoder_mode();// LIGHT_ENC_NONE / BRIGHTNESS / COLORTEMP
+bool        light_screen_is_colorpicker_open();
+```
+
+Encoder mode constants (defined in `light_screen.h`):
+- `LIGHT_ENC_NONE` — no mode active
+- `LIGHT_ENC_BRIGHTNESS` — encoder adjusts brightness
+- `LIGHT_ENC_COLORTEMP` — encoder adjusts colour temperature
+
 ### `src/network/spotify_api.h` — Core 0 (network task) only
 
 ```cpp
@@ -162,6 +207,9 @@ bool spotify_previous();
 ```
 Core 0 — networkTask() + mic task     Core 1 — loop() / Arduino main
 ──────────────────────────────────    ────────────────────────────────────
+mic task (separate, priority 4):      Swipe left/right → lv_scr_load_anim()
+                                        KEF ↔ light screen (g_active_screen)
+                                      Encoder: mode-aware (g_encoder_mode)
 mic task (separate, priority 4):      ArduinoOTA.handle()
   Reads I2S PDM ~30 Hz               lv_timer_handler() every 5ms
   Updates g_mic_level (volatile u8)
@@ -221,6 +269,24 @@ static volatile bool g_source_is_usb;
 static volatile bool g_is_muted;
 static volatile bool g_spotify_active;  // true = Spotify session detected on USB
 static volatile int  g_progress_pct;    // track progress 0-100
+
+// Light state — written by Core 0 (MQTT callback), read by Core 1
+// Defined in mqtt_client.cpp, declared extern in mqtt_client.h
+volatile bool  g_light_on;
+volatile int   g_light_brightness;
+volatile int   g_light_colortemp;
+volatile float g_light_color_hue;
+volatile float g_light_color_sat;
+volatile bool  g_light_state_dirty;
+
+// Light encoder targets — Core 1 → Core 0
+static volatile int  g_light_brightness_target;  // -1 = none pending
+static volatile int  g_light_colortemp_target;
+static volatile char g_light_cmd[192];            // JSON payload, Core 1 → Core 0
+
+// Screen / encoder mode — Core 1 only (same core, no mutex)
+static volatile int  g_encoder_mode;   // ENCODER_MODE_KEF_VOLUME/LIGHT_BRIGHT/LIGHT_COLORTEMP
+static volatile int  g_active_screen;  // SCREEN_KEF / SCREEN_LIGHT
 
 // Album art pipeline (lock-free single-producer/single-consumer)
 static volatile uint8_t *g_art_jpeg_buf;  // Core 0 writes when nullptr; Core 1 clears to nullptr after decode
@@ -443,6 +509,50 @@ Mute button: blue icon + dark bg when unmuted; orange icon + dark-red bg when mu
 
 **Arc geometry:** 240° sweep from 150° to 30° (gap at bottom, 30°→150° clockwise). Arc endpoints are at center-relative y=+70. Progress bar top at y=+73 is below the arc — no overlap.
 
+### Light control screen (swipe left from KEF screen)
+
+Layer order (back → front): dark background → 4 round buttons → centre label → colour picker overlay
+
+**Layout (360×360, positions are center-relative offsets):**
+
+| Element | Absolute pos | CENTER offset | Notes |
+|---|---|---|---|
+| Colour Picker button | (180, 80) | (0, -100) | 60×60, `LV_SYMBOL_EDIT`, opens/closes colour picker popup |
+| Brightness mode button | (80, 180) | (-100, 0) | 60×60, `LV_SYMBOL_IMAGE`, radio toggle |
+| Colour Temp mode button | (280, 180) | (+100, 0) | 60×60, `LV_SYMBOL_SETTINGS`, radio toggle |
+| Power Toggle button | (180, 280) | (0, +100) | 60×60, `LV_SYMBOL_POWER`, queues `{"state":"TOGGLE"}` |
+| Centre label | (180, 180) | (0, 0) | Montserrat 30, shows context value (see below) |
+
+**Centre label content:**
+- Brightness mode active → `"72%"` (brightness/254 × 100)
+- Colour temp mode active → `"3700K"` (1 000 000 / mired, rounded to nearest 100 K)
+- Neither active → `"Office\nLight"`
+
+**Button states:**
+- Active mode button: `#003050` bg (dark blue tint)
+- Inactive mode button: `#252525` bg
+- Power button: `#1A3A1A` / green icon when on; `#252525` / grey when off
+
+**Default encoder mode on screen entry:** `LIGHT_ENC_BRIGHTNESS` (Brightness button pre-lit)
+
+**Encoder behaviour (mode-aware):**
+- `ENCODER_MODE_LIGHT_BRIGHT`: each step ±`LIGHT_BRIGHTNESS_STEP` (3), debounced 150ms MQTT publish
+- `ENCODER_MODE_LIGHT_COLORTEMP`: each step ±`LIGHT_COLORTEMP_STEP` (10), debounced 150ms publish
+- `ENCODER_MODE_KEF_VOLUME`: unchanged from KEF screen
+
+**Colour picker popup:**
+- Full-screen dark overlay (`LV_OPA_80`)
+- `lv_colorwheel_create()` 240×240, `LV_ALIGN_CENTER (0, -10)`
+- `LV_EVENT_VALUE_CHANGED` queues `{"color":{"hue":H,"saturation":S}}`
+- Brightness label at top: `"Brightness: 72%"`, updates via encoder
+- "Done" button at `CENTER (0, +140)` closes popup, restores previous encoder mode
+- While open: `light_screen_get_encoder_mode()` returns `LIGHT_ENC_BRIGHTNESS`; swipe gestures suppressed
+
+**Navigation:**
+- Swipe left on KEF screen → light screen (`LV_SCR_LOAD_ANIM_MOVE_LEFT`, 300ms)
+- Swipe right on light screen → KEF screen (`LV_SCR_LOAD_ANIM_MOVE_RIGHT`, 300ms)
+- Swipe-down control panel is suppressed on the light screen
+
 ### Control panel (swipe down from top)
 - Dark overlay, 260×130, hidden until swipe-from-top gesture
 - Power button (green = on, grey = standby)
@@ -517,5 +627,5 @@ while True:
 
 ---
 
-*Last updated: 2026-02-18*
-*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), Spotify API integration on USB (now-playing + playback control + progress), OTA firmware updates (ArduinoOTA via `deskknob.local`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent), **real-time mic waveform visualiser** (replaces progress bar — MSM261D4030H1CPM PDM MEMS mic → I2S0 PDM RX → 20-bar animated waveform driven by ambient sound)*
+*Last updated: 2026-02-22*
+*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), Spotify API integration on USB (now-playing + playback control + progress), OTA firmware updates (ArduinoOTA via `deskknob.local`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent), **real-time mic waveform visualiser** (replaces progress bar — MSM261D4030H1CPM PDM MEMS mic → I2S0 PDM RX → 20-bar animated waveform driven by ambient sound), **Hue light control screen** (swipe left → second LVGL screen with brightness/colour-temp/power/colour-picker via Zigbee2MQTT on 192.168.1.99:1883; PubSubClient; encoder is mode-aware; lv_colorwheel popup for hue/saturation)*

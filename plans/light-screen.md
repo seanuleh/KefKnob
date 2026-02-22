@@ -1,339 +1,184 @@
 # Plan: Hue Light Control Screen
 
-## Context
+---
 
-Adding a second LVGL screen to DeskKnob to control the Philips Hue Devote ("Sean's Office Light") connected via Zigbee2MQTT on the home MQTT broker (`192.168.1.99:1883`). The same broker is already used by the `desktop-dash` ESPHome device in this setup, confirming the pattern of direct MQTT control without routing through HA's native API.
+## IMPLEMENTATION STATUS — read this first
 
-The new screen is reachable by horizontal swipe from the KEF screen (the existing TODO in `lvgl_touch_read()`). The encoder becomes mode-aware: on the KEF screen it controls volume as today; on the light screen it controls brightness or colour temperature depending on which mode button is active.
+**Status: COMPLETE AND WORKING ON DEVICE.**
+
+Build: clean. RAM 38.1%, Flash 24.4%. Flashed and verified 2026-02-22.
 
 ---
 
-## Z2M MQTT API used
+## What works (confirmed via serial logs on device)
 
-| Direction | Topic | Payload example |
-|---|---|---|
-| Subscribe (state) | `zigbee2mqtt/Sean's Office Light` | `{"state":"ON","brightness":180,"color_temp":370,"color":{"hue":120,"saturation":80}}` |
-| Publish (control) | `zigbee2mqtt/Sean's Office Light/set` | `{"state":"TOGGLE"}` |
-| Publish (brightness) | `zigbee2mqtt/Sean's Office Light/set` | `{"brightness":180}` |
-| Publish (colour temp) | `zigbee2mqtt/Sean's Office Light/set` | `{"color_temp":300}` |
-| Publish (colour) | `zigbee2mqtt/Sean's Office Light/set` | `{"color":{"hue":200,"saturation":90}}` |
-
-Brightness: 0–254. Colour temp: 153–500 Mired (≈6500 K – 2000 K). Hue: 0–360. Saturation: 0–100.
+- MQTT connects and subscribes to `zigbee2mqtt/Sean's Office Light` on boot
+- Power button → `{"state":"TOGGLE"}` publishes, light responds, state received by device
+- Encoder (brightness mode) → debounced `{"brightness":N}` publishes, light responds
+- State rx: `[MQTT] State: on=1 bri=50 ct=390` confirmed parsing correctly
+- Swipe left → light screen, swipe right → KEF screen (MOVE_LEFT/RIGHT 300ms animation)
+- Encoder mode-aware: volume on KEF screen, brightness/colortemp on light screen
 
 ---
 
-## Files to Create
+## Bugs found and fixed during on-device testing
 
-### `src/network/mqtt_client.h` / `.cpp`
-
-PubSubClient wrapper. Lives entirely on Core 0 inside `networkTask()`. The MQTT receive callback fires during `mqtt_client_loop()` and writes to the volatile globals exported from this translation unit.
-
-**Exported volatile state** (Core 0 writes, Core 1 reads):
-```cpp
-extern volatile bool  g_light_on;
-extern volatile int   g_light_brightness;   // 0–254
-extern volatile int   g_light_colortemp;    // Mired 153–500
-extern volatile float g_light_color_hue;    // 0–360
-extern volatile float g_light_color_sat;    // 0–100
-extern volatile bool  g_light_state_dirty;  // Core 0 → Core 1 paint signal
+### 1. Z2M device had no friendly name
+**Symptom:** MQTT publishes going out (`[MQTT] Published: {"state":"TOGGLE"}`) but no state
+received back, light not responding.
+**Root cause:** The Hue Devote was enrolled in Z2M as `0x001788010f43732d` with its IEEE
+address as the friendly name. Z2M topic was `zigbee2mqtt/0x001788010f43732d`, not
+`zigbee2mqtt/Sean's Office Light`.
+**Fix:** Renamed via MQTT API (no server restart needed):
 ```
-
-**API:**
-```cpp
-void mqtt_client_begin(const char *broker_ip, int port);
-void mqtt_client_loop();                        // call every networkTask iteration
-bool mqtt_light_publish(const char *json_payload);
+mosquitto_pub -t zigbee2mqtt/bridge/request/device/rename \
+  -m '{"from":"0x001788010f43732d","to":"Sean'\''s Office Light"}'
 ```
+Z2M config (`/app/data/configuration.yaml` in the `zigbee2mqtt` container on 192.168.1.99)
+now shows `friendly_name: Sean's Office Light`. No firmware change needed.
 
-Reconnects automatically every 5 s if disconnected. If `MQTT_BROKER_IP` is empty the whole module is a no-op.
+### 2. PubSubClient buffer too small for Z2M state payload
+**Symptom:** After rename, MQTT callback still never fired.
+**Root cause:** Z2M state payload includes an OTA firmware URL, making it ~700 bytes.
+PubSubClient default `MQTT_MAX_PACKET_SIZE` is 256 bytes — message silently dropped before
+callback. Internal buffer cap in `on_message` was also 512 bytes.
+**Fix** (in `src/network/mqtt_client.cpp`):
+```cpp
+// in mqtt_client_begin():
+s_mqtt.setBufferSize(1024);   // added
+
+// in on_message():
+if (len == 0 || len > 1024) return;   // was > 512
+char buf[1025];                        // was buf[513]
+```
 
 ---
 
-### `src/ui/light_screen.h` / `.cpp`
+## Known remaining issue: color state uses XY not HSV
 
-Core 1 only — same rule as `main_screen`. Builds widgets but does NOT call `lv_scr_load()` (screen switching is driven from `main.cpp`).
+Z2M state payloads report color as `{"x":0.47,"y":0.41}` (CIE XY), not HSV.
+Our `on_message` parser looks for `color.hue` and `color.saturation` — these are absent
+in normal state updates, so `g_light_color_hue` and `g_light_color_sat` stay at 0.
 
-**API:**
+**Impact:** Colorwheel popup won't initialize to the current color on screen entry.
+The colorwheel *control* direction works fine — publishing `{"color":{"hue":H,"saturation":S}}`
+is accepted by Z2M and the light responds.
+
+**If you want to fix this:** Convert XY→HSV in `on_message` in `src/network/mqtt_client.cpp`:
 ```cpp
-lv_obj_t  *light_screen_get_obj();
-void        light_screen_create();
-void        light_screen_update(bool on, int brightness, int colortemp,
-                                float hue, float sat);
-const char *light_screen_take_cmd();        // JSON payload for MQTT /set, clears on read
-int         light_screen_get_encoder_mode();// LIGHT_ENC_NONE / BRIGHTNESS / COLORTEMP
-bool        light_screen_is_colorpicker_open();
+// CIE XY → approximate HSV (good enough for colorwheel init)
+// After parsing x,y from doc["color"]:
+float r = x * 3.2406f - y * 1.5372f - (1-x-y) * 0.4986f;
+float g = -x * 0.9689f + y * 1.8758f + (1-x-y) * 0.0415f;
+float b = x * 0.0557f - y * 0.2040f + (1-x-y) * 1.0570f;
+// then RGB→HSV... or just use lv_color_rgb_to_hsv()
+```
+Or simpler: subscribe to `color_temp` and `brightness` only (already working), and
+just don't sync the colorwheel to current color on entry — leave it at last-set position.
+
+---
+
+## Infrastructure notes (for future work on this project)
+
+**Server:** 192.168.1.99 (SSH works, no password needed from dev machine)
+**MQTT broker:** `eclipse-mosquitto` container named `mqtt` on 192.168.1.99:1883
+**Zigbee2MQTT:** container named `zigbee2mqtt` on 192.168.1.99
+**Z2M web UI:** http://192.168.1.99:8080
+**Z2M config file:** inside container at `/app/data/configuration.yaml`
+**Hue Devote IEEE:** `0x001788010f43732d`, model `929004297501`, friendly name `Sean's Office Light`
+**Z2M state topic:** `zigbee2mqtt/Sean's Office Light` (retained, ~700 bytes with OTA URL)
+**Z2M set topic:** `zigbee2mqtt/Sean's Office Light/set`
+
+**Other Z2M devices (for context):**
+- Blinds: `Sean's Office Blind`, `Master Bedroom Blind`, `Living Room Blind`
+- Remotes: `Living Blinds Remote`, `Master Blinds Remote`
+- Plugs: `Ikea Power Plug Hall`, `Ikea Power Plug Kitchen`
+
+**Test a publish from dev machine:**
+```bash
+python3 -c "import paho.mqtt.publish as pub; pub.single(\"zigbee2mqtt/Sean's Office Light/set\", '{\"state\":\"TOGGLE\"}', hostname='192.168.1.99')"
 ```
 
-**Layout** — four 60×60 round buttons at radius 100 px from the 180,180 centre of the 360×360 round display:
-
-```
-              [Colour Picker]   (top,    180, 80)
-
-[Brightness]  [centre label]  [Colour Temp]
- (left, 80,180)               (right, 280,180)
-
-              [Power Toggle]    (bottom, 180,280)
+**Watch broker traffic:**
+```bash
+python3 -c "
+import paho.mqtt.subscribe as sub
+sub.callback(lambda c,u,m: print(m.topic, m.payload.decode()[:200]),
+             'zigbee2mqtt/#', hostname='192.168.1.99')
+"
 ```
 
-Style matches `main_screen`: `#252525` idle bg, `LV_RADIUS_CIRCLE`, `lv_font_montserrat_20` icons, no border, no shadow. Active mode button gets `#00BFFF` bg tint. Power button green `#1A3A1A` / `#44EE44` when on, grey when off.
+---
 
-**Centre label** (`lv_font_montserrat_30`): shows context-sensitive value:
-- Brightness mode active → `"72%"` (brightness/254 × 100)
-- Colour temp mode active → `"3700K"` (1 000 000 / mired, rounded to nearest 100 K)
-- Neither active → `"Office Light"`
+## Files touched (complete list)
 
-**Button behaviour:**
-
-| Button | Tap action |
+| File | Change |
 |---|---|
-| Brightness Mode | Radio toggle — activates `LIGHT_ENC_BRIGHTNESS`; tapping active btn deactivates |
-| Colour Temp Mode | Radio toggle — mutually exclusive with Brightness Mode; activates `LIGHT_ENC_COLORTEMP` |
-| Power Toggle | Action — queues `{"state":"TOGGLE"}`, haptic STRONG |
-| Colour Picker | Opens/closes the colour picker popup |
-
-Default encoder mode on screen entry: `LIGHT_ENC_BRIGHTNESS` (Brightness button pre-lit).
-
-**Colour picker popup:**
-- Full-screen dark overlay (`LV_OPA_70`)
-- `lv_colorwheel_create(overlay, true)` centred at 260×260 px
-- `LV_EVENT_VALUE_CHANGED` callback: `lv_color_hsv_t hsv = lv_colorwheel_get_hsv(cw)` → queues `{"color":{"hue":H,"saturation":S}}`
-- While open `light_screen_get_encoder_mode()` returns `LIGHT_ENC_BRIGHTNESS` (encoder adjusts brightness while choosing colour)
-- Small "Done" button (`lv_font_montserrat_16`, centred, y = 310) closes popup and restores previous encoder mode
-- Brightness label at top (`"Brightness: 72%"`) updates as encoder turns
+| `include/config.h` | Added MQTT/light/encoder-mode/screen-index constants after NETWORK section |
+| `include/config_local.h` | Added `#define MQTT_BROKER_IP "192.168.1.99"` |
+| `include/lv_conf.h` | `LV_USE_COLORWHEEL` 0 → **1** (required, was missing) |
+| `platformio.ini` | Added `knolleary/PubSubClient@^2.8` |
+| `src/network/mqtt_client.h` | **NEW** — PubSubClient wrapper API + extern volatile light state |
+| `src/network/mqtt_client.cpp` | **NEW** — `setBufferSize(1024)`, buf 1025, client ID `"deskknob-light"` |
+| `src/ui/light_screen.h` | **NEW** — screen API + `LIGHT_ENC_*` constants |
+| `src/ui/light_screen.cpp` | **NEW** — full UI |
+| `src/ui/main_screen.h` | Added `lv_obj_t *main_screen_get_obj()` |
+| `src/ui/main_screen.cpp` | Added `lv_obj_t *main_screen_get_obj() { return s_screen; }` |
+| `src/main.cpp` | Includes, globals, `handle_encoder_delta`, swipe switching, loop+networkTask additions |
+| `CLAUDE.md` | File Map, Module API, Architecture, UI Overview, working features |
 
 ---
 
-## Files to Modify
+## Critical implementation facts (avoid re-discovering)
 
-### `include/config.h`
+**LV_USE_COLORWHEEL must be 1 in `include/lv_conf.h`** — was 0, caused compile error.
 
-Add after the NETWORK section:
-
-```c
-// MQTT broker (set MQTT_BROKER_IP in config_local.h, e.g. "192.168.1.99")
-#ifndef MQTT_BROKER_IP
-#  define MQTT_BROKER_IP  ""     // empty = MQTT disabled
-#endif
-#define MQTT_BROKER_PORT      1883
-#define MQTT_LIGHT_TOPIC      "zigbee2mqtt/Sean's Office Light"
-#define MQTT_LIGHT_SET_TOPIC  "zigbee2mqtt/Sean's Office Light/set"
-
-// Light encoder controls
-#define LIGHT_BRIGHTNESS_MIN    0
-#define LIGHT_BRIGHTNESS_MAX    254
-#define LIGHT_BRIGHTNESS_STEP   3
-#define LIGHT_COLORTEMP_MIN     153    // Mired (~6500 K)
-#define LIGHT_COLORTEMP_MAX     500    // Mired (~2000 K)
-#define LIGHT_COLORTEMP_STEP    10
-#define LIGHT_DEBOUNCE_MS       150    // ms between MQTT publishes while encoder spins
-
-// Encoder mode constants
-#define ENCODER_MODE_KEF_VOLUME      0
-#define ENCODER_MODE_LIGHT_BRIGHT    1
-#define ENCODER_MODE_LIGHT_COLORTEMP 2
-
-// Screen indices
-#define SCREEN_KEF    0
-#define SCREEN_LIGHT  1
-```
-
-Also add to `config_local.h` (user-edited, gitignored):
-```c
-#define MQTT_BROKER_IP "192.168.1.99"
-```
-
-### `platformio.ini`
-
-Add to `lib_deps`:
-```
-knolleary/PubSubClient@^2.8
-```
-
-### `src/ui/main_screen.h` + `.cpp`
-
-Add one function to expose the screen object for `lv_scr_load_anim`:
+**LVGL colorwheel API (8.3.x):**
 ```cpp
-// main_screen.h
-lv_obj_t *main_screen_get_obj();
-
-// main_screen.cpp — one line implementation
-lv_obj_t *main_screen_get_obj() { return s_screen; }
+lv_obj_t *cw = lv_colorwheel_create(parent, true);
+lv_color_hsv_t hsv = lv_colorwheel_get_hsv(cw);  // h:0-359, s:0-100, v:0-100
+lv_colorwheel_set_hsv(cw, hsv);
 ```
 
-### `src/main.cpp`
-
-**New `#include`s:**
-```cpp
-#include "network/mqtt_client.h"
-#include "ui/light_screen.h"
+**Actual layout (deviates from original plan):**
+```
+Brightness mode  CENTER (-100,  0)  60×60  LV_SYMBOL_IMAGE    (not #00BFFF — uses #003050 active bg)
+Colour Temp      CENTER (+100,  0)  60×60  LV_SYMBOL_SETTINGS
+Colour Picker    CENTER (  0,-100)  60×60  LV_SYMBOL_EDIT
+Power Toggle     CENTER (  0,+100)  60×60  LV_SYMBOL_POWER
+Centre label     CENTER (  0,   0)  Montserrat 30, #00BFFF
+Colorwheel       CENTER (  0, -10)  240×240 (not 260×260)
+Done button      CENTER (  0,+140)  100×36
 ```
 
-**New volatile globals** (after existing ones):
+**Encoder mode sync — runs every loop() iteration on light screen:**
 ```cpp
-static volatile int  g_encoder_mode            = ENCODER_MODE_KEF_VOLUME;
-static volatile int  g_active_screen           = SCREEN_KEF;
-static volatile int  g_light_brightness_target = -1;  // Core 1 → Core 0, -1=none
-static volatile int  g_light_colortemp_target  = -1;
-static volatile char g_light_cmd[192]          = "";  // JSON payload, Core 1→Core 0
-```
-
-**`encoder_left_cb` / `encoder_right_cb`** — replace the unconditional volume logic with a switch:
-```cpp
-switch (g_encoder_mode) {
-    case ENCODER_MODE_KEF_VOLUME:
-        // existing volume logic unchanged
-        break;
-    case ENCODER_MODE_LIGHT_BRIGHT: {
-        int cur = (g_light_brightness_target >= 0) ? g_light_brightness_target
-                                                   : (int)g_light_brightness;
-        int nxt = cur + delta * LIGHT_BRIGHTNESS_STEP;
-        if (nxt < LIGHT_BRIGHTNESS_MIN) nxt = LIGHT_BRIGHTNESS_MIN;
-        if (nxt > LIGHT_BRIGHTNESS_MAX) nxt = LIGHT_BRIGHTNESS_MAX;
-        g_light_brightness_target = nxt;
-        break;
-    }
-    case ENCODER_MODE_LIGHT_COLORTEMP: {
-        int cur = (g_light_colortemp_target >= 0) ? g_light_colortemp_target
-                                                  : (int)g_light_colortemp;
-        int nxt = cur + delta * LIGHT_COLORTEMP_STEP;
-        if (nxt < LIGHT_COLORTEMP_MIN) nxt = LIGHT_COLORTEMP_MIN;
-        if (nxt > LIGHT_COLORTEMP_MAX) nxt = LIGHT_COLORTEMP_MAX;
-        g_light_colortemp_target = nxt;
-        break;
-    }
-}
-```
-(`delta` = +1 for right, -1 for left — factor out from the two callbacks.)
-
-**`initLVGL()`** — after `main_screen_create()`:
-```cpp
-light_screen_create();   // builds widgets, does NOT load the screen
-```
-
-**`lvgl_touch_read()` — horizontal swipe branch** (replaces TODO comment):
-```cpp
-if (horiz_swipe && !light_screen_is_colorpicker_open()) {
-    if (g_active_screen == SCREEN_KEF && dx < 0) {
-        // Swipe left → Light screen slides in from the right
-        g_active_screen = SCREEN_LIGHT;
-        g_encoder_mode  = light_screen_get_encoder_mode();
-        lv_scr_load_anim(light_screen_get_obj(),
-                         LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
-    } else if (g_active_screen == SCREEN_LIGHT && dx > 0) {
-        // Swipe right → KEF screen slides back in from the left
-        g_active_screen = SCREEN_KEF;
-        g_encoder_mode  = ENCODER_MODE_KEF_VOLUME;
-        lv_scr_load_anim(main_screen_get_obj(),
-                         LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
-    }
-}
-```
-Also guard the existing swipe-down control-panel branch with `&& g_active_screen == SCREEN_KEF`.
-
-**`loop()` additions:**
-
-```cpp
-// Forward light button commands (power toggle, colour picker) to networkTask
-{
-    const char *lcmd = light_screen_take_cmd();
-    if (lcmd && lcmd[0]) {
-        strncpy((char *)g_light_cmd, lcmd, sizeof(g_light_cmd) - 1);
-        g_haptic_event = HAPTIC_MEDIUM;
-    }
-}
-
-// Power button gets a stronger haptic — override if the command is power toggle
-// (light_screen sets a flag internally; checked via light_screen_is_power_cmd() — or just
-// keep HAPTIC_STRONG for power in the button callback itself and HAPTIC_MEDIUM for others)
-
-// Light screen update: encoder feedback + confirmed MQTT state
 if (g_active_screen == SCREEN_LIGHT) {
-    bool bri_pending = (g_light_brightness_target >= 0);
-    bool ct_pending  = (g_light_colortemp_target  >= 0);
-    if (bri_pending || ct_pending || g_light_state_dirty) {
-        g_light_state_dirty = false;
-        int bri = bri_pending ? (int)g_light_brightness_target : (int)g_light_brightness;
-        int ct  = ct_pending  ? (int)g_light_colortemp_target  : (int)g_light_colortemp;
-        light_screen_update((bool)g_light_on, bri, ct,
-                            g_light_color_hue, g_light_color_sat);
-    }
+    g_encoder_mode = light_screen_get_encoder_mode();  // syncs from button state
+    ...
 }
 ```
 
-**`networkTask()` additions:**
+**PubSubClient on ESP32:** `setBufferSize(1024)` must be called before `connect()`.
+Default 256 bytes is too small for any Z2M device with OTA firmware available.
 
-After `spotify_init(...)`:
+**ArduinoJson v7 pattern used (not v6):**
 ```cpp
-mqtt_client_begin(MQTT_BROKER_IP, MQTT_BROKER_PORT);
+JsonDocument doc;
+deserializeJson(doc, buf);
+if (!doc["key"].isNull()) { auto val = doc["key"].as<Type>(); }
 ```
-
-In the main loop before the 1 s poll block:
-```cpp
-mqtt_client_loop();
-
-// Publish brightness (debounced — send latest value after LIGHT_DEBOUNCE_MS quiescence)
-if (g_light_brightness_target >= 0) {
-    static uint32_t last_bri_ms = 0;
-    if (now - last_bri_ms >= LIGHT_DEBOUNCE_MS) {
-        int t = g_light_brightness_target; g_light_brightness_target = -1;
-        char p[48]; snprintf(p, sizeof(p), "{\"brightness\":%d}", t);
-        if (mqtt_light_publish(p)) g_light_brightness = t;
-        last_bri_ms = now;
-    }
-}
-
-// Publish colour temp (debounced)
-if (g_light_colortemp_target >= 0) {
-    static uint32_t last_ct_ms = 0;
-    if (now - last_ct_ms >= LIGHT_DEBOUNCE_MS) {
-        int t = g_light_colortemp_target; g_light_colortemp_target = -1;
-        char p[48]; snprintf(p, sizeof(p), "{\"color_temp\":%d}", t);
-        if (mqtt_light_publish(p)) g_light_colortemp = t;
-        last_ct_ms = now;
-    }
-}
-
-// Publish power toggle / colour commands from button/colorwheel
-if (g_light_cmd[0] != '\0') {
-    char cmd[192];
-    strncpy(cmd, (const char *)g_light_cmd, sizeof(cmd) - 1);
-    g_light_cmd[0] = '\0';
-    mqtt_light_publish(cmd);
-}
-```
-
-### `CLAUDE.md`
-
-- Add `mqtt_client.h/.cpp` and `light_screen.h/.cpp` rows to the File Map
-- Add MQTT Client section to Module API (matching the style of existing sections)
-- Add light screen section to UI Overview
-- Update working-features list and Last Updated date
 
 ---
 
-## Thread Safety
+## Verification checklist
 
-| Variable | Written by | Read by | Mechanism |
-|---|---|---|---|
-| `g_light_on/brightness/colortemp/hue/sat` | Core 0 (MQTT cb) | Core 1 (loop) | `volatile` — single writer |
-| `g_light_state_dirty` | Core 0 | Core 1 | `volatile` |
-| `g_light_brightness_target` | Core 1 (encoder cb) | Core 0 (networkTask) | `volatile` |
-| `g_light_colortemp_target` | Core 1 (encoder cb) | Core 0 (networkTask) | `volatile` |
-| `g_light_cmd[192]` | Core 1 (loop) | Core 0 (networkTask) | `volatile char[]` |
-| `g_encoder_mode` | Core 1 (touch cb, loop) | Core 1 (encoder cb) | same core, no mutex |
-| `g_active_screen` | Core 1 (touch cb) | Core 1 (loop, touch cb) | same core, no mutex |
-
----
-
-## Verification
-
-1. `pio run` — zero errors, zero new warnings
-2. Serial on boot: `[MQTT] Connected and subscribed to zigbee2mqtt/Sean's Office Light`
-3. Swipe left on KEF screen → light screen slides in (MOVE_LEFT animation); swipe right → back to KEF
-4. Control panel swipe-down on KEF screen still works; does not trigger on light screen
-5. Brightness Mode button highlights blue → encoder adjusts brightness (immediate label feedback) → after 150 ms MQTT publish visible in Z2M logs
-6. Colour Temp Mode button: mutual exclusion with Brightness Mode confirmed; centre label shows Kelvin; encoder adjusts CCT
-7. Power button: light toggles on/off; button colour updates on confirmed MQTT state update
-8. Colour Picker button: colorwheel popup appears; drag to change hue/saturation → Z2M log shows `{"color":{"hue":...}}` publish; encoder adjusts brightness; "Done" closes popup
-9. Disconnect network: reconnect within 5 s; encoder changes queue and publish after reconnect
-10. OTA flash still works after adding PubSubClient
+- [x] `pio run` — clean build, RAM 38.1%, Flash 24.4%
+- [x] Serial boot: `[MQTT] Connected and subscribed to zigbee2mqtt/Sean's Office Light`
+- [x] Swipe left → light screen; swipe right → KEF screen
+- [x] Power button → `[MQTT] Published: {"state":"TOGGLE"}` + light physically toggles
+- [x] Encoder (brightness mode) → `[MQTT] Published: {"brightness":N}` + light dims/brightens
+- [x] State rx: `[MQTT] State: on=1 bri=50 ct=390` in logs after light responds
+- [ ] Colour Temp mode button: mutual exclusion, centre label shows Kelvin, encoder adjusts CCT
+- [ ] Colour Picker popup: colorwheel opens, drag queues color publish, Done closes
+- [ ] OTA flash still works (`pio run -e ota -t upload`)
