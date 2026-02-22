@@ -264,6 +264,13 @@ void loop() {
         }
     }
 
+    // --- Encoder mode: keep in sync with the active screen ---
+    if (g_active_screen == SCREEN_KEF) {
+        // Always enforce volume mode on the KEF screen so a failed swipe-back
+        // never leaves the encoder stuck in a light-screen mode.
+        g_encoder_mode = ENCODER_MODE_KEF_VOLUME;
+    }
+
     // --- Light screen: sync encoder mode and redraw on state/target change ---
     if (g_active_screen == SCREEN_LIGHT) {
         // Sync encoder mode from button state (buttons update internal mode on tap)
@@ -832,9 +839,19 @@ void networkTask(void *pvParameters) {
             // Speaker power state — use speakerStatus endpoint, not player state.
             // Player "state" field reports "stopped" for both off AND on-but-idle,
             // so it cannot reliably detect standby.
-            bool speaker_on = true;
-            if (kef_get_speaker_status(&speaker_on)) {
-                g_power_on = speaker_on;
+            // When the speaker enters deep standby its network stack may go down,
+            // causing HTTP requests to time out.  After 3 consecutive failures we
+            // assume the speaker is off so the standby overlay is shown.
+            {
+                static int status_fail_count = 0;
+                bool speaker_on = true;
+                if (kef_get_speaker_status(&speaker_on)) {
+                    g_power_on = speaker_on;
+                    status_fail_count = 0;
+                } else if (++status_fail_count >= 3) {
+                    g_power_on = false;
+                    DEBUG_PRINTLN("[KEF] speakerStatus API failing — assuming standby");
+                }
             }
 
             // --- Player data: Spotify on USB, KEF on WiFi ---
