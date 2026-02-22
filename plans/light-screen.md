@@ -7,6 +7,7 @@
 **Status: COMPLETE AND WORKING ON DEVICE.**
 
 Build: clean. RAM 38.1%, Flash 24.4%. Flashed and verified 2026-02-22.
+Cold-boot light state bug fixed 2026-02-22 (see bug #3 below).
 
 ---
 
@@ -51,6 +52,25 @@ s_mqtt.setBufferSize(1024);   // added
 if (len == 0 || len > 1024) return;   // was > 512
 char buf[1025];                        // was buf[513]
 ```
+
+### 3. Light screen shows stale defaults on cold boot
+**Symptom:** Navigating to the light screen shortly after boot shows wrong state — power
+button off, brightness at 50%, regardless of actual light state.
+**Root cause:** `light_screen_update()` is only called from `loop()` when
+`g_active_screen == SCREEN_LIGHT` AND (`g_light_state_dirty || bri_pending || ct_pending`).
+On cold boot MQTT is still connecting; if the user swipes to the light screen before the
+retained Z2M state message arrives, `g_light_state_dirty` is false and `light_screen_update()`
+is never called — the screen stays on the `light_screen_create()` defaults indefinitely
+(even after MQTT delivers the retained message, because the flag was never set while the
+screen was active and nobody re-sets it on screen entry).
+**Fix** (in `src/main.cpp`, swipe-left handler inside `lvgl_touch_read()`):
+```cpp
+g_light_state_dirty = true;  // ensure light_screen_update() fires on entry
+```
+Added immediately after `g_active_screen = SCREEN_LIGHT`. This guarantees
+`light_screen_update()` runs on the next `loop()` iteration after every navigation to the
+light screen. If MQTT state has already arrived the globals are correct; if not, they're
+defaults that self-correct once the retained message is processed.
 
 ---
 

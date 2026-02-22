@@ -639,8 +639,9 @@ void lvgl_touch_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
             if (horiz_swipe && !light_screen_is_colorpicker_open()) {
                 if (g_active_screen == SCREEN_KEF && dx < 0) {
                     // Swipe left → light screen slides in from the right
-                    g_active_screen = SCREEN_LIGHT;
-                    g_encoder_mode  = light_screen_get_encoder_mode();
+                    g_active_screen     = SCREEN_LIGHT;
+                    g_encoder_mode      = light_screen_get_encoder_mode();
+                    g_light_state_dirty = true;  // ensure light_screen_update() fires on entry
                     lv_scr_load_anim(light_screen_get_obj(),
                                      LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
                     DEBUG_PRINTLN("[Touch] Swipe left → light screen");
