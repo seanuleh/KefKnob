@@ -627,5 +627,5 @@ while True:
 
 ---
 
-*Last updated: 2026-02-22*
+*Last updated: 2026-03-16*
 *Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), Spotify API integration on USB (now-playing + playback control + progress), OTA firmware updates (ArduinoOTA via `deskknob.local`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent), **real-time mic waveform visualiser** (replaces progress bar — MSM261D4030H1CPM PDM MEMS mic → I2S0 PDM RX → 20-bar animated waveform driven by ambient sound), **Hue light control screen** (swipe left → second LVGL screen with brightness/colour-temp/power/colour-picker via Zigbee2MQTT on 192.168.1.99:1883; PubSubClient; encoder is mode-aware; lv_colorwheel popup for hue/saturation)*

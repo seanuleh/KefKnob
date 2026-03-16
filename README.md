@@ -12,7 +12,7 @@ Control volume, switch inputs, skip tracks, and see what's playing — all from 
 - **Now playing** — track title, artist, and album art
   - WiFi source: metadata pulled directly from the KEF speaker API
   - USB source: metadata pulled from the Spotify Web API when Spotify is active
-- **Track progress bar** — live playback position shown below the track info
+- **Waveform visualiser** — real-time 20-bar mic waveform replaces the progress bar; driven by the built-in PDM MEMS microphone
 - **Playback control** — on-screen prev/play-pause/next buttons
   - WiFi source: routes through KEF track control API
   - USB source: routes through Spotify Web API (requires Spotify Premium)
@@ -20,6 +20,9 @@ Control volume, switch inputs, skip tracks, and see what's playing — all from 
 - **Input switching** — WiFi and USB via swipe-down control panel
 - **Standby screen** — shown when speaker is off; tap WiFi or USB to wake
 - **Power control** — toggle standby from the control panel
+- **Hue light control** — swipe left to a dedicated light screen; control brightness, colour temperature, hue/saturation, and power via Zigbee2MQTT; encoder is mode-aware
+- **Haptic feedback** — DRV2605 haptic driver; click on encoder turns, strong pulse on play/pause, medium pulse on next/prev/mute
+- **OTA firmware updates** — upload new firmware wirelessly via `deskknob.local`
 
 ---
 
@@ -86,14 +89,20 @@ Replace the port with yours (`pio device list` to find it).
 
 | Gesture / Control | Action |
 |---|---|
-| Rotate encoder | Adjust volume |
+| Rotate encoder | Adjust volume (KEF screen) or brightness/colour temp (light screen) |
 | Tap prev button | Previous track |
 | Tap play/pause button | Play / pause |
 | Tap next button | Next track |
 | Tap mute button (USB, no Spotify) | Toggle mute |
 | Swipe down from top | Open control panel (power, WiFi input, USB input) |
+| Swipe left | Switch to light control screen |
+| Swipe right (light screen) | Switch back to KEF screen |
 | Tap WiFi on standby screen | Wake speaker on WiFi input |
 | Tap USB on standby screen | Wake speaker on USB input |
+| Tap Brightness button (light screen) | Set encoder to brightness mode |
+| Tap Colour Temp button (light screen) | Set encoder to colour temp mode |
+| Tap colour picker button (light screen) | Open hue/saturation colour wheel |
+| Tap power button (light screen) | Toggle light on/off |
 
 ---
 
@@ -108,11 +117,19 @@ KefKnob/
 │   └── lv_conf.h               # LVGL configuration
 ├── src/
 │   ├── main.cpp                # App wiring: tasks, LVGL init, touch/encoder input
-│   ├── drivers/                # SH8601 display, CST816S touch, encoder
+│   ├── drivers/
+│   │   ├── display_sh8601.cpp/.h   # SH8601 QSPI display driver
+│   │   ├── touch_cst816.cpp/.h     # CST816S touch driver
+│   │   ├── encoder.c/.h            # Rotary encoder (iot_knob)
+│   │   ├── drv2605.c/.h            # DRV2605 haptic feedback driver
+│   │   └── mic_pdm.cpp/.h          # PDM MEMS microphone I2S driver
 │   ├── network/
 │   │   ├── kef_api.cpp/.h      # KEF HTTP API (volume, player data, source, power)
-│   │   └── spotify_api.cpp/.h  # Spotify Web API (now-playing + playback control)
-│   └── ui/                     # LVGL screen layout and updates
+│   │   ├── spotify_api.cpp/.h  # Spotify Web API (now-playing + playback control)
+│   │   └── mqtt_client.cpp/.h  # MQTT client for Zigbee2MQTT light control
+│   └── ui/
+│       ├── main_screen.cpp/.h  # KEF playback screen
+│       └── light_screen.cpp/.h # Hue light control screen
 ├── poc/                        # Proof-of-concept scripts (Python)
 ├── platformio.ini
 ├── CLAUDE.md                   # Developer / AI agent reference
