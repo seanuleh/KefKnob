@@ -27,6 +27,28 @@ static bool http_get(const char *url, String &response_out) {
     return true;
 }
 
+// POST JSON body to /api/setData. body must be a complete JSON object string.
+static bool http_post_setdata(const char *json_body, String &response_out) {
+    char url[64];
+    snprintf(url, sizeof(url), "http://" KEF_SPEAKER_IP "/api/setData");
+
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT);
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+
+    int code = http.POST((uint8_t *)json_body, strlen(json_body));
+    if (code != 200) {
+        DEBUG_PRINTF("[KEF] setData POST error %d\n", code);
+        http.end();
+        return false;
+    }
+
+    response_out = http.getString();
+    http.end();
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Volume
 // ---------------------------------------------------------------------------
@@ -65,18 +87,15 @@ bool kef_set_volume(int volume) {
     if (volume < VOLUME_MIN) volume = VOLUME_MIN;
     if (volume > VOLUME_MAX) volume = VOLUME_MAX;
 
-    char url[256];
-    snprintf(url, sizeof(url),
-             "http://" KEF_SPEAKER_IP
-             "/api/setData?path=player%%3Avolume&roles=value"
-             "&value=%%7B%%22type%%22%%3A%%22i32_%%22%%2C%%22i32_%%22%%3A%d%%7D",
+    char json[64];
+    snprintf(json, sizeof(json),
+             "{\"path\":\"player:volume\",\"roles\":\"value\","
+             "\"value\":{\"type\":\"i32_\",\"i32_\":%d}}",
              volume);
 
     String body;
-    bool ok = http_get(url, body);
-    if (ok) {
-        DEBUG_PRINTF("[KEF] Volume set to %d\n", volume);
-    }
+    bool ok = http_post_setdata(json, body);
+    if (ok) DEBUG_PRINTF("[KEF] Volume set to %d\n", volume);
     return ok;
 }
 
@@ -144,18 +163,15 @@ bool kef_get_player_data(char *title, size_t title_len,
 // ---------------------------------------------------------------------------
 
 bool kef_track_control(const char *cmd) {
-    char url[256];
-    snprintf(url, sizeof(url),
-             "http://" KEF_SPEAKER_IP
-             "/api/setData?path=player%%3Aplayer%%2Fcontrol&roles=activate"
-             "&value=%%7B%%22control%%22%%3A%%22%s%%22%%7D",
+    char json[96];
+    snprintf(json, sizeof(json),
+             "{\"path\":\"player:player/control\",\"roles\":\"activate\","
+             "\"value\":{\"control\":\"%s\"}}",
              cmd);
 
     String body;
-    bool ok = http_get(url, body);
-    if (ok) {
-        DEBUG_PRINTF("[KEF] Track control: %s\n", cmd);
-    }
+    bool ok = http_post_setdata(json, body);
+    if (ok) DEBUG_PRINTF("[KEF] Track control: %s\n", cmd);
     return ok;
 }
 
@@ -187,16 +203,14 @@ bool kef_get_source(char *source, size_t source_len) {
 // ---------------------------------------------------------------------------
 
 bool kef_set_mute(bool muted) {
-    // value={"type":"bool_","bool_":true/false}
-    char url[320];
-    snprintf(url, sizeof(url),
-             "http://" KEF_SPEAKER_IP
-             "/api/setData?path=settings%%3A%%2FmediaPlayer%%2Fmute&roles=value"
-             "&value=%%7B%%22type%%22%%3A%%22bool_%%22%%2C%%22bool_%%22%%3A%s%%7D",
+    char json[96];
+    snprintf(json, sizeof(json),
+             "{\"path\":\"settings:/mediaPlayer/mute\",\"roles\":\"value\","
+             "\"value\":{\"type\":\"bool_\",\"bool_\":%s}}",
              muted ? "true" : "false");
 
     String body;
-    bool ok = http_get(url, body);
+    bool ok = http_post_setdata(json, body);
     if (ok) DEBUG_PRINTF("[KEF] Mute set to %s\n", muted ? "true" : "false");
     return ok;
 }
@@ -255,17 +269,13 @@ bool kef_set_power(bool on) {
 }
 
 bool kef_power_on() {
-    // Wake from stopped/standby using roles=value with "powerOn" source.
-    // This is the only mechanism that works when the speaker is in stopped state
-    // (roles=activate returns HTTP 500 in that state).
-    char url[320];
-    snprintf(url, sizeof(url),
-             "http://" KEF_SPEAKER_IP
-             "/api/setData?path=settings%%3A%%2Fkef%%2Fplay%%2FphysicalSource&roles=value"
-             "&value=%%7B%%22type%%22%%3A%%22kefPhysicalSource%%22%%2C%%22kefPhysicalSource%%22%%3A%%22powerOn%%22%%7D");
+    char json[128];
+    snprintf(json, sizeof(json),
+             "{\"path\":\"settings:/kef/play/physicalSource\",\"roles\":\"value\","
+             "\"value\":{\"type\":\"kefPhysicalSource\",\"kefPhysicalSource\":\"powerOn\"}}");
 
     String body;
-    bool ok = http_get(url, body);
+    bool ok = http_post_setdata(json, body);
     if (ok) DEBUG_PRINTLN("[KEF] Wake (powerOn) sent");
     else    DEBUG_PRINTLN("[KEF] Wake (powerOn) failed");
     return ok;
@@ -276,17 +286,14 @@ bool kef_power_on() {
 // ---------------------------------------------------------------------------
 
 bool kef_set_source(const char *source) {
-    // All physicalSource commands (source switch, power on, standby) use roles=value.
-    // roles=activate returns HTTP 500 on this firmware — confirmed via pykefcontrol.
-    char url[320];
-    snprintf(url, sizeof(url),
-             "http://" KEF_SPEAKER_IP
-             "/api/setData?path=settings%%3A%%2Fkef%%2Fplay%%2FphysicalSource&roles=value"
-             "&value=%%7B%%22type%%22%%3A%%22kefPhysicalSource%%22%%2C%%22kefPhysicalSource%%22%%3A%%22%s%%22%%7D",
+    char json[128];
+    snprintf(json, sizeof(json),
+             "{\"path\":\"settings:/kef/play/physicalSource\",\"roles\":\"value\","
+             "\"value\":{\"type\":\"kefPhysicalSource\",\"kefPhysicalSource\":\"%s\"}}",
              source);
 
     String body;
-    bool ok = http_get(url, body);
+    bool ok = http_post_setdata(json, body);
     if (ok) DEBUG_PRINTF("[KEF] Source set to %s\n", source);
     else    DEBUG_PRINTF("[KEF] Source set FAILED for %s\n", source);
     return ok;
