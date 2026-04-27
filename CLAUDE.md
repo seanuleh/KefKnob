@@ -210,13 +210,13 @@ Core 0 — networkTask() + mic task     Core 1 — loop() / Arduino main
 mic task (separate, priority 4):      Swipe left/right → lv_scr_load_anim()
                                         KEF ↔ light screen (g_active_screen)
                                       Encoder: mode-aware (g_encoder_mode)
-mic task (separate, priority 4):      ArduinoOTA.handle()
+mic task (separate, priority 4):      s_ota_server.handleClient()
   Reads I2S PDM ~30 Hz               lv_timer_handler() every 5ms
   Updates g_mic_level (volatile u8)
                                       Waveform update every MIC_BAR_MS (80ms):
 networkTask() — Loops every 50ms        reads g_mic_level, pushes to ring buf,
   ├─ If g_volume_dirty AND               calls main_screen_update_waveform()
-  │    250ms since last send:         ArduinoOTA.handle()
+  │    250ms since last send:         s_ota_server.handleClient()
   │    kef_set_volume()               lv_timer_handler() every 5ms
   │    250ms since last send:           Reads g_volume_target → immediate
   │    kef_set_volume()                   arc redraw (no waiting)
@@ -593,11 +593,12 @@ If credentials are empty, Spotify is silently skipped — the USB screen shows t
 pio run                                                        # build only (both envs)
 pio run -e esp32-s3-devkitc-1 -t upload \
     --upload-port /dev/cu.usbmodem101                          # serial flash
-pio run -e ota -t upload                                       # OTA flash via deskknob.local
+pio run -e ota -t upload                                       # HTTP-OTA flash to deskknob.local
+                                                                # (POSTs firmware.bin to http://deskknob.local/update)
 pio run -t clean
 ```
 
-OTA hostname and optional password: `OTA_HOSTNAME` / `OTA_PASSWORD` in `include/config.h`.
+OTA hostname: `OTA_HOSTNAME` in `include/config.h`. The device runs an HTTP server on port 80; visit `http://deskknob.local/` for a manual upload form, or `pio run -e ota -t upload` to flash via the `scripts/ota_upload.py` PlatformIO custom uploader (multipart POST of `firmware.bin` to `/update`).
 
 **Read serial output** (`pio device monitor` doesn't work headless):
 ```python
@@ -624,12 +625,12 @@ while True:
 - Spotify now-playing not showing → check credentials in `config_local.h`; check serial for `[Spotify]` log lines
 - Spotify playback control returning 403 → Spotify Premium required; verify `user-modify-playback-state` scope
 - Spotify 401 in logs → refresh token invalid or scope missing; re-run auth script
-- OTA upload failing → device must be on WiFi and booted; use hostname `deskknob.local` or set IP directly in `platformio.ini`
+- OTA upload failing → device must be on WiFi and booted. OTA is HTTP-based (`POST /update` on port 80, served by built-in `WebServer` + `Update.h`). Test with `curl http://deskknob.local/` — should return an HTML upload form. ArduinoOTA / espota.py was removed because UDP 3232 is unreliable on Arduino-ESP32 3.x + ESP32-S3 + macOS
 - Waveform always flat → check serial for `[Mic] PDM init failed` — I2S0 may be in use by another driver, or GPIO 45/46 are in use
 - Waveform jumpy/noisy → tune `MIC_BAR_MS` (slower) or tighten the decay constant in `mic_pdm.cpp`
 - Waveform bars don't respond to music → the mic picks up ambient room sound; move DeskKnob closer to speakers or increase speaker volume
 
 ---
 
-*Last updated: 2026-03-16*
-*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), Spotify API integration on USB (now-playing + playback control + progress), OTA firmware updates (ArduinoOTA via `deskknob.local`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent), **real-time mic waveform visualiser** (replaces progress bar — MSM261D4030H1CPM PDM MEMS mic → I2S0 PDM RX → 20-bar animated waveform driven by ambient sound), **Hue light control screen** (swipe left → second LVGL screen with brightness/colour-temp/power/colour-picker via Zigbee2MQTT on 192.168.1.99:1883; PubSubClient; encoder is mode-aware; lv_colorwheel popup for hue/saturation)*
+*Last updated: 2026-04-27*
+*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), Spotify API integration on USB (now-playing + playback control + progress), HTTP-OTA firmware updates (`POST /update` on `deskknob.local` via built-in `WebServer` + `Update.h`; `pio run -e ota -t upload` shells out to `curl` from `scripts/ota_upload.py`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent), **real-time mic waveform visualiser** (replaces progress bar — MSM261D4030H1CPM PDM MEMS mic → I2S0 PDM RX → 20-bar animated waveform driven by ambient sound), **Hue light control screen** (swipe left → second LVGL screen with brightness/colour-temp/power/colour-picker via Zigbee2MQTT on 192.168.1.99:1883; PubSubClient; encoder is mode-aware; lv_colorwheel popup for hue/saturation)*

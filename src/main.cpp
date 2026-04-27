@@ -14,7 +14,9 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ArduinoOTA.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Update.h>
 #include <lvgl.h>
 #include "config.h"
 #include "drivers/display_sh8601.h"
@@ -199,10 +201,6 @@ void setup() {
     initWiFi();
     DEBUG_PRINTLN("[INIT] WiFi initialized");
 
-    // Allow lwIP's UDP subsystem to settle after WiFi association before
-    // ArduinoOTA tries to bind UDP 3232 — bind fails silently without this.
-    delay(500);
-
     DEBUG_PRINTLN("[INIT] Initializing OTA...");
     initOTA();
     DEBUG_PRINTLN("[INIT] OTA initialized");
@@ -220,8 +218,10 @@ void setup() {
 // loop() — Core 1 LVGL pump + art decode
 // ============================================================================
 
+static WebServer s_ota_server(80);
+
 void loop() {
-    ArduinoOTA.handle();
+    s_ota_server.handleClient();
     lv_timer_handler();
 
     // --- Album art decode (Core 1 only — LVGL canvas write) ---
@@ -485,24 +485,48 @@ void initWiFi() {
 }
 
 void initOTA() {
-    ArduinoOTA.setHostname(OTA_HOSTNAME);
-#ifdef OTA_PASSWORD
-    ArduinoOTA.setPassword(OTA_PASSWORD);
-#endif
-    ArduinoOTA.onStart([]() {
-        DEBUG_PRINTLN("[OTA] Starting update...");
+    if (!MDNS.begin(OTA_HOSTNAME)) {
+        DEBUG_PRINTLN("[OTA] mDNS responder failed to start");
+    }
+    MDNS.addService("http", "tcp", 80);
+
+    s_ota_server.on("/", HTTP_GET, []() {
+        s_ota_server.send(200, "text/html",
+            "<form method='POST' action='/update' enctype='multipart/form-data'>"
+            "<input type='file' name='firmware'><input type='submit' value='Update'>"
+            "</form>");
     });
-    ArduinoOTA.onEnd([]() {
-        DEBUG_PRINTLN("[OTA] Done. Rebooting.");
-    });
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        DEBUG_PRINTF("[OTA] %u%%\n", progress * 100 / total);
-    });
-    ArduinoOTA.onError([](ota_error_t error) {
-        DEBUG_PRINTF("[OTA] Error(%u)\n", error);
-    });
-    ArduinoOTA.begin();
-    DEBUG_PRINTF("[OTA] Hostname: %s.local  IP: %s\n",
+
+    s_ota_server.on("/update", HTTP_POST,
+        []() {
+            bool ok = !Update.hasError();
+            s_ota_server.sendHeader("Connection", "close");
+            s_ota_server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
+            if (ok) {
+                delay(200);
+                ESP.restart();
+            }
+        },
+        []() {
+            HTTPUpload &upload = s_ota_server.upload();
+            if (upload.status == UPLOAD_FILE_START) {
+                DEBUG_PRINTF("[OTA] Start: %s\n", upload.filename.c_str());
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+            } else if (upload.status == UPLOAD_FILE_WRITE) {
+                if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                    Update.printError(Serial);
+                }
+            } else if (upload.status == UPLOAD_FILE_END) {
+                if (Update.end(true)) {
+                    DEBUG_PRINTF("[OTA] Done: %u bytes\n", upload.totalSize);
+                } else {
+                    Update.printError(Serial);
+                }
+            }
+        });
+
+    s_ota_server.begin();
+    DEBUG_PRINTF("[OTA] http://%s.local/  IP: %s\n",
                  OTA_HOSTNAME, WiFi.localIP().toString().c_str());
 }
 
