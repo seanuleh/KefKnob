@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <NetworkClientSecure.h>
+#include <NetworkClient.h>
 #include <ArduinoJson.h>
 
 // ---------------------------------------------------------------------------
@@ -87,11 +88,10 @@ bool kef_set_volume(int volume) {
     if (volume < VOLUME_MIN) volume = VOLUME_MIN;
     if (volume > VOLUME_MAX) volume = VOLUME_MAX;
 
-    char json[64];
+    char json[80];
     snprintf(json, sizeof(json),
              "{\"path\":\"player:volume\",\"roles\":\"value\","
-             "\"value\":{\"type\":\"i32_\",\"i32_\":%d}}",
-             volume);
+             "\"value\":{\"type\":\"i32_\",\"i32_\":%d}}", volume);
 
     String body;
     bool ok = http_post_setdata(json, body);
@@ -166,8 +166,7 @@ bool kef_track_control(const char *cmd) {
     char json[96];
     snprintf(json, sizeof(json),
              "{\"path\":\"player:player/control\",\"roles\":\"activate\","
-             "\"value\":{\"control\":\"%s\"}}",
-             cmd);
+             "\"value\":{\"control\":\"%s\"}}", cmd);
 
     String body;
     bool ok = http_post_setdata(json, body);
@@ -206,8 +205,7 @@ bool kef_set_mute(bool muted) {
     char json[96];
     snprintf(json, sizeof(json),
              "{\"path\":\"settings:/mediaPlayer/mute\",\"roles\":\"value\","
-             "\"value\":{\"type\":\"bool_\",\"bool_\":%s}}",
-             muted ? "true" : "false");
+             "\"value\":{\"type\":\"bool_\",\"bool_\":%s}}", muted ? "true" : "false");
 
     String body;
     bool ok = http_post_setdata(json, body);
@@ -269,13 +267,11 @@ bool kef_set_power(bool on) {
 }
 
 bool kef_power_on() {
-    char json[128];
-    snprintf(json, sizeof(json),
-             "{\"path\":\"settings:/kef/play/physicalSource\",\"roles\":\"value\","
-             "\"value\":{\"type\":\"kefPhysicalSource\",\"kefPhysicalSource\":\"powerOn\"}}");
-
     String body;
-    bool ok = http_post_setdata(json, body);
+    bool ok = http_post_setdata(
+        "{\"path\":\"settings:/kef/play/physicalSource\",\"roles\":\"value\","
+        "\"value\":{\"type\":\"kefPhysicalSource\",\"kefPhysicalSource\":\"powerOn\"}}",
+        body);
     if (ok) DEBUG_PRINTLN("[KEF] Wake (powerOn) sent");
     else    DEBUG_PRINTLN("[KEF] Wake (powerOn) failed");
     return ok;
@@ -289,8 +285,7 @@ bool kef_set_source(const char *source) {
     char json[128];
     snprintf(json, sizeof(json),
              "{\"path\":\"settings:/kef/play/physicalSource\",\"roles\":\"value\","
-             "\"value\":{\"type\":\"kefPhysicalSource\",\"kefPhysicalSource\":\"%s\"}}",
-             source);
+             "\"value\":{\"type\":\"kefPhysicalSource\",\"kefPhysicalSource\":\"%s\"}}", source);
 
     String body;
     bool ok = http_post_setdata(json, body);
@@ -304,12 +299,19 @@ bool kef_set_source(const char *source) {
 // ---------------------------------------------------------------------------
 
 uint8_t *kef_fetch_jpeg(const char *url, size_t *out_size) {
-    NetworkClientSecure client;
-    client.setInsecure();  // Album art: cert verification not required
+    bool is_https = strncmp(url, "https://", 8) == 0;
+
+    NetworkClientSecure secure_client;
+    NetworkClient plain_client;
 
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT);
-    if (!http.begin(client, url)) {
+
+    bool begun = is_https
+        ? (secure_client.setInsecure(), http.begin(secure_client, url))
+        : http.begin(plain_client, url);
+
+    if (!begun) {
         DEBUG_PRINTF("[Art] http.begin failed for %s\n", url);
         return nullptr;
     }
@@ -321,8 +323,6 @@ uint8_t *kef_fetch_jpeg(const char *url, size_t *out_size) {
         return nullptr;
     }
 
-    // Reject non-JPEG and oversize responses
-    String ct = http.header("Content-Type");
     int content_len = http.getSize();
     if (content_len <= 0 || content_len > (int)ALBUM_ART_MAX_JPEG) {
         DEBUG_PRINTF("[Art] Bad size %d (max %d)\n", content_len, ALBUM_ART_MAX_JPEG);
@@ -339,7 +339,8 @@ uint8_t *kef_fetch_jpeg(const char *url, size_t *out_size) {
 
     Stream *stream = http.getStreamPtr();
     int total = 0;
-    while (total < content_len) {
+    uint32_t deadline = millis() + HTTP_TIMEOUT;
+    while (total < content_len && millis() < deadline) {
         int avail = stream->available();
         if (avail > 0) {
             int chunk = stream->readBytes(buf + total, min(avail, content_len - total));

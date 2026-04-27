@@ -12,7 +12,7 @@
     #warning "config_local.h not found! Copy config_local.h.example to config_local.h"
     #define WIFI_SSID "YOUR_WIFI_SSID"
     #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-    #define KEF_SPEAKER_IP "192.168.1.217"
+    #define KEF_SPEAKER_IP "0.0.0.0"
 #endif
 
 // Spotify credentials — set in config_local.h. Leave empty to disable.

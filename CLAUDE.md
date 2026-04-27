@@ -367,6 +367,10 @@ Note: **position is not in the API response**. Track progress on WiFi source is 
 
 **Critical: ALL `physicalSource` commands use `roles=value`**, not `roles=activate`. `roles=activate` returns HTTP 500 on this firmware. Track control (`player:player/control`) is the only command that uses `roles=activate`.
 
+**setData is POST, not GET** (post-repair firmware). Body format: `{"path":"...","roles":"...","value":{...}}` where `value` is a **nested JSON object**, not a string. Returns `true` on success. Buffer must be at least 80 bytes for volume, 96 for track control, 96 for mute, 128 for source/power.
+
+**`kef_fetch_jpeg` must use plain `NetworkClient` for `http://` URLs** — using `NetworkClientSecure` on a non-TLS server hangs indefinitely and blocks the entire network task, preventing all polling and control commands.
+
 **Speaker status values** (`kefSpeakerStatus`):
 - `"powerOn"` — speaker is physically on (playing, paused, or idle)
 - anything else — speaker is in standby
