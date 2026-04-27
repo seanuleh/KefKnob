@@ -199,6 +199,10 @@ void setup() {
     initWiFi();
     DEBUG_PRINTLN("[INIT] WiFi initialized");
 
+    // Allow lwIP's UDP subsystem to settle after WiFi association before
+    // ArduinoOTA tries to bind UDP 3232 — bind fails silently without this.
+    delay(500);
+
     DEBUG_PRINTLN("[INIT] Initializing OTA...");
     initOTA();
     DEBUG_PRINTLN("[INIT] OTA initialized");
