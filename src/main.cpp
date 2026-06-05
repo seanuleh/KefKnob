@@ -18,6 +18,8 @@
 #include <ESPmDNS.h>
 #include <Update.h>
 #include <lvgl.h>
+#include <esp_heap_caps.h>
+#include <mbedtls/platform.h>
 #include "config.h"
 #include "drivers/display_sh8601.h"
 #include "drivers/touch_cst816.h"
@@ -133,8 +135,35 @@ void networkTask(void *pvParameters);
 // setup()
 // ============================================================================
 
+// Route mbedTLS heap allocations to PSRAM. The Arduino-ESP32 3.x precompiled
+// libs are built with CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=1 and
+// CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=16384, so a TLS handshake needs ~32KB of
+// contiguous internal heap — more than is free after LVGL init. esp_config.h
+// enables MBEDTLS_PLATFORM_MEMORY without a CALLOC_MACRO, so the runtime hook
+// below redirects every mbedtls_calloc/free to PSRAM.
+static volatile uint32_t g_mbedtls_alloc_calls = 0;
+static volatile uint32_t g_mbedtls_alloc_fails = 0;
+static volatile size_t   g_mbedtls_alloc_biggest = 0;
+static void *psram_calloc(size_t n, size_t size) {
+    size_t total = n * size;
+    g_mbedtls_alloc_calls++;
+    if (total > g_mbedtls_alloc_biggest) g_mbedtls_alloc_biggest = total;
+    void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        // Fall back to internal heap so we never return NULL when PSRAM is full
+        p = heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!p) g_mbedtls_alloc_fails++;
+    }
+    return p;
+}
+static void psram_free(void *p) {
+    heap_caps_free(p);
+}
+
 void setup() {
     initSerial();
+
+    mbedtls_platform_set_calloc_free(psram_calloc, psram_free);
 
     DEBUG_PRINTLN("===========================================");
     DEBUG_PRINTLN("DeskKnob - KEF LSX II Controller");
@@ -749,35 +778,48 @@ void networkTask(void *pvParameters) {
             bool player_data_ok = false;
             bool is_standby     = false;
 
-            if (g_source_is_usb) {
+            if (g_source_is_usb && g_power_on) {
                 // USB source — poll Spotify for now-playing metadata.
-                // The same shared state and art pipeline are reused as-is.
-                bool sp_playing = false;
-                bool sp_nothing = false;
-                uint32_t sp_progress_ms = 0, sp_duration_ms = 0;
-                if (spotify_get_now_playing(title,     sizeof(title),
-                                            artist,    sizeof(artist),
-                                            cover_url, sizeof(cover_url),
-                                            &sp_playing, &sp_nothing,
-                                            &sp_progress_ms, &sp_duration_ms)) {
-                    playing          = sp_playing;
-                    sp_is_playing    = sp_playing;
-                    player_data_ok   = true;
-                    g_spotify_active = true;
-                    g_progress_pct   = (sp_duration_ms > 0)
-                        ? (int)((uint64_t)sp_progress_ms * 100 / sp_duration_ms) : 0;
-                } else if (sp_nothing) {
-                    // Spotify explicitly says nothing is playing — clear screen
-                    strncpy(title,  "--", sizeof(title));
-                    strncpy(artist, "--", sizeof(artist));
-                    cover_url[0]     = '\0';
-                    playing          = false;
-                    sp_is_playing    = false;
-                    player_data_ok   = true;
-                    g_spotify_active = false;
-                    g_progress_pct   = 0;
+                // Adaptive interval: SPOTIFY_POLL_ACTIVE_MS while playing,
+                // SPOTIFY_POLL_IDLE_MS while paused / nothing playing.
+                // Keeps us well under Spotify's rolling 30 s rate-limit budget.
+                static uint32_t last_spotify_poll_ms = 0;
+                static uint32_t spotify_interval_ms  = SPOTIFY_POLL_ACTIVE_MS;
+                if (last_spotify_poll_ms == 0 ||
+                    now - last_spotify_poll_ms >= spotify_interval_ms) {
+                    last_spotify_poll_ms = now;
+
+                    bool sp_playing = false;
+                    bool sp_nothing = false;
+                    uint32_t sp_progress_ms = 0, sp_duration_ms = 0;
+                    if (spotify_get_now_playing(title,     sizeof(title),
+                                                artist,    sizeof(artist),
+                                                cover_url, sizeof(cover_url),
+                                                &sp_playing, &sp_nothing,
+                                                &sp_progress_ms, &sp_duration_ms)) {
+                        playing          = sp_playing;
+                        sp_is_playing    = sp_playing;
+                        player_data_ok   = true;
+                        g_spotify_active = true;
+                        g_progress_pct   = (sp_duration_ms > 0)
+                            ? (int)((uint64_t)sp_progress_ms * 100 / sp_duration_ms) : 0;
+                        spotify_interval_ms = sp_playing ? SPOTIFY_POLL_ACTIVE_MS
+                                                         : SPOTIFY_POLL_IDLE_MS;
+                    } else if (sp_nothing) {
+                        // Spotify explicitly says nothing is playing — clear screen
+                        strncpy(title,  "--", sizeof(title));
+                        strncpy(artist, "--", sizeof(artist));
+                        cover_url[0]     = '\0';
+                        playing          = false;
+                        sp_is_playing    = false;
+                        player_data_ok   = true;
+                        g_spotify_active = false;
+                        g_progress_pct   = 0;
+                        spotify_interval_ms = SPOTIFY_POLL_IDLE_MS;
+                    }
+                    // On network error / 429: keep previous state. spotify_api.cpp
+                    // already enforces its own Retry-After backoff on 429.
                 }
-                // On network error: keep previous state and g_spotify_active as-is.
             } else {
                 uint32_t kef_pos_ms = 0, kef_dur_ms = 0;
                 player_data_ok = kef_get_player_data(title,     sizeof(title),
@@ -853,6 +895,11 @@ void networkTask(void *pvParameters) {
             // --- Source: polled unconditionally ---
             char source[16] = "";
             if (kef_get_source(source, sizeof(source))) {
+                static char last_logged_source[16] = "";
+                if (strcmp(source, last_logged_source) != 0) {
+                    DEBUG_PRINTF("[KEF] Source = '%s'\n", source);
+                    strncpy(last_logged_source, source, sizeof(last_logged_source) - 1);
+                }
                 g_source_is_usb = (strcmp(source, "usb") == 0);
             }
 

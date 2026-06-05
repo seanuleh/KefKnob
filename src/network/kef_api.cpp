@@ -323,14 +323,16 @@ uint8_t *kef_fetch_jpeg(const char *url, size_t *out_size) {
         return nullptr;
     }
 
-    int content_len = http.getSize();
-    if (content_len <= 0 || content_len > (int)ALBUM_ART_MAX_JPEG) {
-        DEBUG_PRINTF("[Art] Bad size %d (max %d)\n", content_len, ALBUM_ART_MAX_JPEG);
+    int content_len = http.getSize();  // -1 if chunked / no Content-Length
+    if (content_len > (int)ALBUM_ART_MAX_JPEG) {
+        DEBUG_PRINTF("[Art] Content-Length %d exceeds max %d\n", content_len, ALBUM_ART_MAX_JPEG);
         http.end();
         return nullptr;
     }
 
-    uint8_t *buf = (uint8_t *)heap_caps_malloc(content_len, MALLOC_CAP_SPIRAM);
+    // Allocate max if size is unknown (chunked encoding from Spotify CDN)
+    int alloc_size = (content_len > 0) ? content_len : (int)ALBUM_ART_MAX_JPEG;
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM);
     if (!buf) {
         DEBUG_PRINTLN("[Art] PSRAM alloc failed for JPEG");
         http.end();
@@ -340,10 +342,10 @@ uint8_t *kef_fetch_jpeg(const char *url, size_t *out_size) {
     Stream *stream = http.getStreamPtr();
     int total = 0;
     uint32_t deadline = millis() + HTTP_TIMEOUT;
-    while (total < content_len && millis() < deadline) {
+    while (total < alloc_size && millis() < deadline) {
         int avail = stream->available();
         if (avail > 0) {
-            int chunk = stream->readBytes(buf + total, min(avail, content_len - total));
+            int chunk = stream->readBytes(buf + total, min(avail, alloc_size - total));
             total += chunk;
         } else {
             delay(1);
@@ -352,13 +354,18 @@ uint8_t *kef_fetch_jpeg(const char *url, size_t *out_size) {
 
     http.end();
 
-    if (total != content_len) {
+    if (total == 0) {
+        DEBUG_PRINTLN("[Art] Zero bytes read");
+        free(buf);
+        return nullptr;
+    }
+    if (content_len > 0 && total != content_len) {
         DEBUG_PRINTF("[Art] Short read: got %d of %d bytes\n", total, content_len);
         free(buf);
         return nullptr;
     }
 
-    *out_size = (size_t)content_len;
+    *out_size = (size_t)total;
     DEBUG_PRINTF("[Art] Fetched %d bytes JPEG\n", content_len);
     return buf;
 }

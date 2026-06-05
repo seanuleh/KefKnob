@@ -337,8 +337,15 @@ Used only when source is USB (`g_source_is_usb == true`). Credentials in `includ
 | Previous | POST | `api.spotify.com/v1/me/player/previous` |
 
 **HTTP 204** from now-playing = nothing playing → `g_spotify_active = false`, clear display.
-**HTTP 401** = token expired → force refresh, return false (retry on next 1s poll).
+**HTTP 401** = token expired → force refresh, return false (retry on next poll).
+**HTTP 429** = rate-limited → honour `Retry-After` header (`s_rate_limit_until_ms` in `spotify_api.cpp`); skip all calls until the window expires.
 **Playback control requires Spotify Premium.**
+
+**Polling cadence** (Spotify uses a rolling 30s rate-limit window — aggressive polling triggers 429s that can persist for minutes). Configured in `config.h`:
+- `SPOTIFY_POLL_ACTIVE_MS = 5000` — while playing.
+- `SPOTIFY_POLL_IDLE_MS  = 30000` — while paused or nothing playing (HTTP 204).
+- No polling when source ≠ USB or `g_power_on == false`.
+- A previous bug ran the poll every 1s; that produced ~30k req/day on `currently-playing` and tripped Spotify's fair-use throttle. Do not lower these intervals.
 
 **Now-playing fields used:**
 ```
@@ -385,6 +392,8 @@ buf = (lv_color_t *)heap_caps_malloc(size, MALLOC_CAP_DMA);
 - RAM: ~37.5% (123KB / 320KB) — healthy
 - Flash: ~23.3% (1.52MB / 6.25MB) — healthy, ~4× headroom per OTA slot
 - PSRAM: 8MB available, ~26KB used for LVGL draw buffers
+
+**mbedTLS → PSRAM:** Arduino-ESP32 3.x precompiled libs are built with `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=1` and `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=16384`, so each TLS handshake (e.g. Spotify HTTPS) needs ~32KB of contiguous internal heap — more than is free after LVGL init, causing `SSL - Memory allocation failed` (`MBEDTLS_ERR_ALLOC_FAILED = -0x7F00`). `sdkconfig.defaults` does **not** help: the libs are precompiled, sdkconfig changes are ignored. Fix is runtime: `setup()` installs a PSRAM allocator via `mbedtls_platform_set_calloc_free(psram_calloc, psram_free)` (see `src/main.cpp`). This works because the framework's `esp_config.h` defines `MBEDTLS_PLATFORM_MEMORY` without a `CALLOC_MACRO`. The hook also falls back to internal heap if PSRAM ever returns NULL, and tracks call/fail counters for diagnostics.
 
 ---
 
@@ -513,6 +522,7 @@ while True:
 - Spotify now-playing not showing → check credentials in `config_local.h`; check serial for `[Spotify]` log lines
 - Spotify playback control returning 403 → Spotify Premium required; verify `user-modify-playback-state` scope
 - Spotify 401 in logs → refresh token invalid or scope missing; re-run auth script
+- `SSL - Memory allocation failed` (`-0x7F00 / -32512`) on any HTTPS call → mbedTLS is trying to allocate from internal heap; confirm `mbedtls_platform_set_calloc_free()` is installed at the top of `setup()` (see Memory Rules). `sdkconfig.defaults` is ignored by Arduino-ESP32 3.x precompiled libs — runtime hook is the only fix that works without switching platform fork
 - OTA upload failing → device must be on WiFi and booted. OTA is HTTP-based (`POST /update` on port 80, served by built-in `WebServer` + `Update.h`). Test with `curl http://deskknob.local/` — should return an HTML upload form. ArduinoOTA / espota.py was removed because UDP 3232 is unreliable on Arduino-ESP32 3.x + ESP32-S3 + macOS
 - Waveform always flat → check serial for `[Mic] PDM init failed` — I2S0 may be in use by another driver, or GPIO 45/46 are in use
 - Waveform jumpy/noisy → tune `MIC_BAR_MS` (slower) or tighten the decay constant in `mic_pdm.cpp`

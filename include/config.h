@@ -112,6 +112,13 @@
 #define KEF_STATE_POLL_INTERVAL 1000   // Poll KEF state every second
 #define UI_UPDATE_INTERVAL 50           // Update UI every 50ms (20 FPS)
 
+// Spotify polling — Spotify rate-limits aggressively (rolling 30s window).
+// Active (playing on USB):   poll every 5s to catch track changes promptly.
+// Idle (paused / 204 nothing): poll every 30s.
+// Off (standby or non-USB):  no polling at all.
+#define SPOTIFY_POLL_ACTIVE_MS  5000
+#define SPOTIFY_POLL_IDLE_MS    30000
+
 // Input control
 #define VOLUME_DEBOUNCE_MS  250   // Delay before sending volume to speaker
 #define SWIPE_THRESHOLD     50    // Pixels of horizontal movement = swipe

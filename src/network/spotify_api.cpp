@@ -16,6 +16,7 @@ static char s_client_secret[64]  = "";
 static char s_refresh_token[256] = "";
 static char s_access_token[256]  = "";
 static uint32_t s_token_exp_ms   = 0;   // millis() at which to proactively refresh
+static uint32_t s_rate_limit_until_ms = 0; // honour Spotify Retry-After on 429
 
 void spotify_init(const char *client_id,
                   const char *client_secret,
@@ -114,6 +115,18 @@ bool spotify_get_now_playing(char *title,        size_t title_len,
     *out_progress_ms = 0;
     *out_duration_ms = 0;
 
+    if (s_rate_limit_until_ms && (int32_t)(millis() - s_rate_limit_until_ms) < 0) {
+        static uint32_t last_log_ms = 0;
+        if (millis() - last_log_ms > 5000) {  // throttle the log itself
+            uint32_t remaining = s_rate_limit_until_ms - millis();
+            DEBUG_PRINTF("[Spotify] rate-limited, %u ms remaining\n",
+                         (unsigned)remaining);
+            last_log_ms = millis();
+        }
+        return false;
+    }
+    s_rate_limit_until_ms = 0;
+
     if (!ensure_token()) return false;
 
     NetworkClientSecure client;
@@ -128,8 +141,21 @@ bool spotify_get_now_playing(char *title,        size_t title_len,
     }
     http.addHeader("Authorization",
                    String("Bearer ") + s_access_token);
+    const char *collect_headers[] = { "Retry-After" };
+    http.collectHeaders(collect_headers, 1);
 
     int code = http.GET();
+
+    if (code == 429) {
+        // Spotify is rate-limiting us. Honour Retry-After (seconds); cap at 5 min.
+        int retry_s = http.header("Retry-After").toInt();
+        if (retry_s <= 0) retry_s = 30;
+        if (retry_s > 300) retry_s = 300;
+        s_rate_limit_until_ms = millis() + (uint32_t)retry_s * 1000;
+        DEBUG_PRINTF("[Spotify] 429 — backing off for %d s\n", retry_s);
+        http.end();
+        return false;
+    }
 
     if (code == 204) {
         // No active playback session
