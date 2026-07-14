@@ -17,6 +17,7 @@ static char s_refresh_token[256] = "";
 static char s_access_token[256]  = "";
 static uint32_t s_token_exp_ms   = 0;   // millis() at which to proactively refresh
 static uint32_t s_rate_limit_until_ms = 0; // honour Spotify Retry-After on 429
+static bool     s_token_dead     = false; // refresh token expired (invalid_grant) — stop retrying
 
 void spotify_init(const char *client_id,
                   const char *client_secret,
@@ -24,6 +25,7 @@ void spotify_init(const char *client_id,
     strncpy(s_client_id,     client_id,     sizeof(s_client_id)     - 1);
     strncpy(s_client_secret, client_secret, sizeof(s_client_secret) - 1);
     strncpy(s_refresh_token, refresh_token, sizeof(s_refresh_token) - 1);
+    s_token_dead = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -33,6 +35,10 @@ void spotify_init(const char *client_id,
 static bool do_token_refresh() {
     if (!s_client_id[0] || !s_client_secret[0] || !s_refresh_token[0]) {
         DEBUG_PRINTLN("[Spotify] Credentials not configured — skipping");
+        return false;
+    }
+    if (s_token_dead) {
+        // Refresh token already known-expired — don't hammer the endpoint.
         return false;
     }
 
@@ -64,7 +70,16 @@ static bool do_token_refresh() {
 
     int code = http.POST(body);
     if (code != 200) {
-        DEBUG_PRINTF("[Spotify] Token refresh HTTP %d\n", code);
+        String err = http.getString();
+        DEBUG_PRINTF("[Spotify] Token refresh HTTP %d: %s\n", code, err.c_str());
+        // Spotify returns 400 {"error":"invalid_grant"} for an expired/revoked
+        // refresh token (6-month expiry from 2026-07-20). No on-device sign-in
+        // possible — flag it dead, stop retrying, and shout in the log.
+        if (code == 400 && err.indexOf("invalid_grant") >= 0) {
+            s_token_dead = true;
+            DEBUG_PRINTLN("[Spotify] REFRESH TOKEN EXPIRED — re-run auth script, "
+                          "update SPOTIFY_REFRESH_TOKEN in config_local.h, re-flash");
+        }
         http.end();
         return false;
     }

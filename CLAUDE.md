@@ -328,6 +328,8 @@ Used only when source is USB (`g_source_is_usb == true`). Credentials in `includ
 
 **Auth flow:** Authorization Code with refresh token. One-time setup via Python script embedded in `config_local.h` comments. The access token is refreshed automatically 5 minutes before expiry.
 
+**Refresh token 6-month expiry (from 2026-07-20):** Spotify now expires refresh tokens after 6 months. On expiry the refresh POST returns HTTP 400 `invalid_grant`. `spotify_api.cpp` detects this, sets `s_token_dead` to stop retrying, and logs `[Spotify] REFRESH TOKEN EXPIRED`. There is no on-device sign-in flow (headless) — recovery is manual: re-run the auth script, update `SPOTIFY_REFRESH_TOKEN`, re-flash. `spotify_init()` clears the flag on boot.
+
 | Function | Method | Endpoint |
 |---|---|---|
 | Now playing (metadata) | GET | `api.spotify.com/v1/me/player/currently-playing` |
@@ -522,6 +524,7 @@ while True:
 - Spotify now-playing not showing → check credentials in `config_local.h`; check serial for `[Spotify]` log lines
 - Spotify playback control returning 403 → Spotify Premium required; verify `user-modify-playback-state` scope
 - Spotify 401 in logs → refresh token invalid or scope missing; re-run auth script
+- `[Spotify] REFRESH TOKEN EXPIRED` in logs → refresh token hit Spotify's 6-month expiry (in force from 2026-07-20; refresh returns HTTP 400 `invalid_grant`). No on-device sign-in possible — `s_token_dead` latches to stop retrying. Fix: re-run the auth script, update `SPOTIFY_REFRESH_TOKEN` in `config_local.h`, re-flash (clears the flag on boot)
 - `SSL - Memory allocation failed` (`-0x7F00 / -32512`) on any HTTPS call → mbedTLS is trying to allocate from internal heap; confirm `mbedtls_platform_set_calloc_free()` is installed at the top of `setup()` (see Memory Rules). `sdkconfig.defaults` is ignored by Arduino-ESP32 3.x precompiled libs — runtime hook is the only fix that works without switching platform fork
 - OTA upload failing → device must be on WiFi and booted. OTA is HTTP-based (`POST /update` on port 80, served by built-in `WebServer` + `Update.h`). Test with `curl http://deskknob.local/` — should return an HTML upload form. ArduinoOTA / espota.py was removed because UDP 3232 is unreliable on Arduino-ESP32 3.x + ESP32-S3 + macOS
 - Waveform always flat → check serial for `[Mic] PDM init failed` — I2S0 may be in use by another driver, or GPIO 45/46 are in use
@@ -530,5 +533,5 @@ while True:
 
 ---
 
-*Last updated: 2026-06-05*
-*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), Spotify API integration on USB (now-playing + playback control + progress), HTTP-OTA firmware updates (`POST /update` on `deskknob.local` via built-in `WebServer` + `Update.h`; `pio run -e ota -t upload` shells out to `curl` from `scripts/ota_upload.py`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent), **real-time mic waveform visualiser** (replaces progress bar — MSM261D4030H1CPM PDM MEMS mic → I2S0 PDM RX → 20-bar animated waveform driven by ambient sound)*
+*Last updated: 2026-07-15*
+*Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), Spotify API integration on USB (now-playing + playback control + progress; refresh-token 6-month expiry handled via invalid_grant detection), HTTP-OTA firmware updates (`POST /update` on `deskknob.local` via built-in `WebServer` + `Update.h`; `pio run -e ota -t upload` shells out to `curl` from `scripts/ota_upload.py`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent), **real-time mic waveform visualiser** (replaces progress bar — MSM261D4030H1CPM PDM MEMS mic → I2S0 PDM RX → 20-bar animated waveform driven by ambient sound)*
