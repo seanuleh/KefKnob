@@ -11,6 +11,7 @@ volatile uint8_t g_band_hmid  = 0;
 volatile uint8_t g_band_high  = 0;
 
 static i2s_chan_handle_t s_rx_chan = NULL;
+TaskHandle_t g_mic_task_handle = NULL;
 
 // ---------------------------------------------------------------------------
 // Log-scale helper: rms → 0–255 with a given noise floor.
@@ -127,6 +128,6 @@ bool mic_pdm_init(int clk_pin, int data_pin) {
         return false;
     }
 
-    xTaskCreatePinnedToCore(mic_task, "mic", 3072, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(mic_task, "mic", 3072, NULL, 4, &g_mic_task_handle, 0);
     return true;
 }

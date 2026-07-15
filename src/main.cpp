@@ -438,6 +438,17 @@ void initWiFi() {
     DEBUG_PRINTF("[WiFi] Signal: %d dBm\n", WiFi.RSSI());
 }
 
+// Suspend/resume the Core 0 tasks (mic + network) around an OTA flash write so
+// their continuous flash/PSRAM access doesn't fault the device mid-update.
+static void ota_suspend_core0() {
+    if (g_mic_task_handle)  vTaskSuspend(g_mic_task_handle);
+    if (networkTaskHandle)  vTaskSuspend(networkTaskHandle);
+}
+static void ota_resume_core0() {
+    if (networkTaskHandle)  vTaskResume(networkTaskHandle);
+    if (g_mic_task_handle)  vTaskResume(g_mic_task_handle);
+}
+
 void initOTA() {
     if (!MDNS.begin(OTA_HOSTNAME)) {
         DEBUG_PRINTLN("[OTA] mDNS responder failed to start");
@@ -465,7 +476,17 @@ void initOTA() {
             HTTPUpload &upload = s_ota_server.upload();
             if (upload.status == UPLOAD_FILE_START) {
                 DEBUG_PRINTF("[OTA] Start: %s\n", upload.filename.c_str());
-                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+                // Quiesce Core 0 for the duration of the flash write. The mic
+                // task (continuous I2S + PSRAM) and networkTask (HTTP/HTTPS +
+                // PSRAM) otherwise race the flash writes and fault the device
+                // ~64KB in, aborting every OTA. Suspend both; resume on
+                // END/error. Runs on Core 1 (WebServer) so suspending Core 0
+                // tasks here is safe.
+                ota_suspend_core0();
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                    Update.printError(Serial);
+                    ota_resume_core0();
+                }
             } else if (upload.status == UPLOAD_FILE_WRITE) {
                 if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
                     Update.printError(Serial);
@@ -476,6 +497,13 @@ void initOTA() {
                 } else {
                     Update.printError(Serial);
                 }
+                // Resume Core 0. On success the device restarts anyway; on
+                // failure this keeps the UI/polling alive for a retry.
+                ota_resume_core0();
+            } else if (upload.status == UPLOAD_FILE_ABORTED) {
+                DEBUG_PRINTLN("[OTA] Aborted");
+                Update.abort();
+                ota_resume_core0();
             }
         });
 

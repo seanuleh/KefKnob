@@ -1,5 +1,7 @@
 #pragma once
 #include <stdint.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // Initialize the PDM MEMS microphone (MSM261D4030H1CPM) via I2S PDM RX.
 //   clk_pin  — PDM clock output (GPIO 45 on Waveshare ESP32-S3 1.8" LCD)
@@ -22,3 +24,8 @@ extern volatile uint8_t g_band_bass;
 extern volatile uint8_t g_band_mid;
 extern volatile uint8_t g_band_hmid;
 extern volatile uint8_t g_band_high;
+
+// Handle of the internal mic task (Core 0). NULL until mic_pdm_init() succeeds.
+// Exposed so callers can vTaskSuspend/Resume it — e.g. to quiesce Core 0 flash/
+// PSRAM traffic during an OTA flash write, which otherwise faults the update.
+extern TaskHandle_t g_mic_task_handle;
