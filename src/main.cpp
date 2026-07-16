@@ -933,7 +933,14 @@ void networkTask(void *pvParameters) {
 
             // Skip volume poll for 3s after sending
             bool volume_settling = (now - volume_sent_ms < 3000);
-            if (!g_volume_dirty && g_volume_target < 0 && !volume_settling) {
+            // Always poll until the baseline is known: a boot-time encoder GPIO
+            // glitch can set g_volume_target/g_volume_dirty BEFORE the first
+            // successful read. Without the !vol_known escape hatch that would
+            // deadlock — the poll is skipped (target pending) so vol_known never
+            // latches, and g_volume_target is never cleared (needs vol_known),
+            // which also wedges Core 1's loop out of the standby-overlay branch.
+            if (!vol_known ||
+                (!g_volume_dirty && g_volume_target < 0 && !volume_settling)) {
                 int vol = 0;
                 if (kef_get_volume(&vol)) {
                     DEBUG_PRINTF("[KEF] Volume: %d\n", vol);

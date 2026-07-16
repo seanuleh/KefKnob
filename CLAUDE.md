@@ -516,6 +516,7 @@ while True:
 - Wrong display colors → check `quad_mode = true` and byte-swap (see Display Gotchas)
 - Volume resets to 0 → KEF rate limit; ensure debounce + 3s poll cooldown are in place
 - Volume set to wrong value at boot → spurious encoder GPIO glitch during init using g_volume=50 as wrong baseline; the `vol_known` guard in networkTask prevents sending until first kef_get_volume() succeeds
+- Volume knob does nothing AND standby overlay never appears (both at once) → `vol_known` deadlock. A boot encoder glitch sets `g_volume_target>=0`/`g_volume_dirty` before the first `kef_get_volume()`. The volume-poll block was gated on `!g_volume_dirty && g_volume_target < 0`, so it skipped the read → `vol_known` never latched; but `g_volume_target` is only cleared when `vol_known` is true → circular deadlock. Core 0 never sends volume (bug), and Core 1's `loop()` stays wedged in the `g_volume_target>=0` branch so the `g_state_dirty` else-branch — which calls `main_screen_update_power_source()` — never runs, hiding the standby screen. Fix: the volume-poll block also runs when `!vol_known`, so the baseline always latches and clears the pending target
 - LVGL crash / corruption → LVGL call made from Core 0 or ISR
 - Multiple definition of `setup` → two `.cpp` files in `src/` both defining `setup()`
 - RAM > 70% → move large allocations to PSRAM
@@ -534,5 +535,5 @@ while True:
 
 ---
 
-*Last updated: 2026-07-15*
+*Last updated: 2026-07-16*
 *Working: display, touch, encoder, WiFi, KEF volume control, track control (WiFi), source switching, power on/off, standby detection, now-playing display, album art, round playback buttons (mute/play-pause/prev/next), Spotify API integration on USB (now-playing + playback control + progress; refresh-token 6-month expiry handled via invalid_grant detection), HTTP-OTA firmware updates (`POST /update` on `deskknob.local` via built-in `WebServer` + `Update.h`; `pio run -e ota -t upload` shells out to `curl` from `scripts/ota_upload.py`; Core 0 mic + network tasks are suspended during the flash write as insurance against flash/PSRAM contention; device IP is `192.168.1.90`, not the unrelated `.61`), haptic feedback via DRV2605 (encoder click, play/pause strong, next/prev/mute medium — graceful no-op if chip absent), **real-time mic waveform visualiser** (replaces progress bar — MSM261D4030H1CPM PDM MEMS mic → I2S0 PDM RX → 20-bar animated waveform driven by ambient sound)*
